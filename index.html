@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>.Gov & .Edu Document Download & Search</title>
+    <script type="importmap">
+    {
+        "imports": {
+            "solid-js": "https://esm.sh/solid-js@1.8.14",
+            "solid-js/web": "https://esm.sh/solid-js@1.8.14/web",
+            "solid-js/h": "https://esm.sh/solid-js@1.8.14/h"
+        }
+    }
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://unpkg.com/topojson-client@3"></script>
+    <style>
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+            -webkit-appearance: none; 
+            margin: 0; 
+        }
+        input[type=number] {
+            -moz-appearance: textfield;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased h-screen overflow-hidden flex flex-col font-sans">
+    <div id="app" class="flex-1 flex flex-col h-full overflow-hidden"></div>
+    <script type="module">
+        import { createSignal, onMount } from "solid-js";
+        import { render } from "solid-js/web";
+        import h from "solid-js/h";
+
+        const stateNameToAbbr = {
+            "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+            "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
+            "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+            "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+            "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO",
+            "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ",
+            "New Mexico": "NM", "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
+            "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+            "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
+            "Virginia": "VA", "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+            "District of Columbia": "DC"
+        };
+
+        function App() {
+            const [pdfs, setPdfs] = createSignal([]);
+            const [domains, setDomains] = createSignal([]);
+            const [q, setQ] = createSignal("");
+            const [embeddingStatus, setEmbeddingStatus] = createSignal("");
+            const [res, setRes] = createSignal([]);
+            const [countyHits, setCountyHits] = createSignal({});
+            const [progress, setProgress] = createSignal({visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, counties_completed: 0, total_counties: 3144, gov_crawled: 0, edu_crawled: 0, total_gov: 0, total_edu: 0});
+            const [showModal, setShowModal] = createSignal(false);
+            const [isPaused, setIsPaused] = createSignal(false);
+            const [isEmbeddingPaused, setIsEmbeddingPaused] = createSignal(false);
+            const [isEmbeddingActive, setIsEmbeddingActive] = createSignal(false);
+            const [isSearching, setIsSearching] = createSignal(false);
+            const [urlQueueStatus, setUrlQueueStatus] = createSignal({ queue_len: 0, current: "Idle" });
+            const [embeddingQueueStatus, setEmbeddingQueueStatus] = createSignal({ queue_len: 0, current: "Idle" });
+            const [graphData, setGraphData] = createSignal({ nodes: [], edges: [], community_count: 0, partitions: [], modularity: 0.0, clustering_coefficient: 0.0 });
+            
+            const [nodeSearchQuery, setNodeSearchQuery] = createSignal("");
+            const [tldFilter, setTldFilter] = createSignal("all");
+            const [queueTldView, setQueueTldView] = createSignal("gov");
+            const [activeBackendMode, setActiveBackendMode] = createSignal("gov");
+
+            const [indexSize, setIndexSize] = createSignal(0);
+            const [processedDocsCount, setProcessedDocsCount] = createSignal(0);
+            const [totalDocsCount, setTotalDocsCount] = createSignal(0);
+            const [totalEmbeddingsCount, setTotalEmbeddingsCount] = createSignal(0);
+
+            const [embeddingLevel, setEmbeddingLevel] = createSignal('chunk');
+            const [hoveredNode, setHoveredNode] = createSignal(null);
+            const [hoverPos, setHoverPos] = createSignal({ x: 0, y: 0 });
+            const [pinnedNodes, setPinnedNodes] = createSignal([]);
+            const [pinMode, setPinMode] = createSignal(false);
+
+            const [activeTab, setActiveTab] = createSignal('map');
+            const [mapLoading, setMapLoading] = createSignal(true);
+
+            let mapContainer;
+            let graphContainer;
+            let sampleSizeInput;
+            let targetPartitionsInput;
+
+            let cachedGovStatusMap = {};
+            let cachedEduStatusMap = {};
+            let canvasZoomTransform = d3.zoomIdentity;
+            let canvasZoomBehavior = null;
+            let currentSimulation = null;
+            let embeddingEvtSource = null;
+            let graphInitialized = false;
+
+            onMount(async () => {
+                try {
+                    const initState = await (await fetch("/state")).json();
+                    if (initState.pdfs) setPdfs(initState.pdfs);
+                    if (initState.progress) setProgress(initState.progress);
+                    const domData = await (await fetch("/domains-status")).json();
+                    setDomains(domData);
+                } catch (e) {}
+
+                try {
+                    const statusRes = await (await fetch("/crawler/status")).json();
+                    setIsPaused(statusRes.paused);
+                    if (statusRes.mode) {
+                        setQueueTldView(statusRes.mode);
+                        setActiveBackendMode(statusRes.mode);
+                        setUrlQueueStatus(q => ({ ...q, queue_len: statusRes.pending_count }));
+                    }
+                } catch (e) {}
+
+                fetchIndexStats();
+
+                if (mapContainer) {
+                    initMap(mapContainer);
+                }
+
+                const connectWs = () => {
+                    const ws = new WebSocket("ws://" + location.host + "/ws");
+                    ws.onmessage = async e => {
+                        const d = JSON.parse(e.data);
+                        if (d.type === "progress" || d.type === "stats") {
+                            if (d.visited !== undefined) setProgress(p => ({...p, visited: d.visited, total: d.total}));
+                            if (d.stats) setProgress(p => ({...p, ...d.stats}));
+                        } else if (d.type === "pdf_found") {
+                            setPdfs(p => [d, ...p]);
+                            fetchIndexStats();
+                        } else if (d.type === "domain_update") {
+                            setDomains(ds => {
+                                const updated = ds.map(dom => dom.domain === d.domain ? {...dom, status: d.status} : dom);
+                                return updated;
+                            });
+                            if (mapContainer && activeTab() === 'map') {
+                                fetchAndUpdateMapColors();
+                            }
+                        } else if (d.type === "embedding_complete") {
+                            setPdfs(p => p.map(doc => doc.pdf_url === d.metric.pdf_url ? {...doc, processed: 1} : doc));
+                            fetchIndexStats();
+                        } else if (d.type === "queue_update") {
+                            if (d.tld_type === activeBackendMode()) {
+                                setUrlQueueStatus({ queue_len: d.queue_len, current: d.current });
+                            }
+                        } else if (d.type === "embedding_queue_update") {
+                            setEmbeddingQueueStatus({ queue_len: d.queue_len, current: d.current });
+                        } else if (d.type === "louvain_progress") {
+                            setEmbeddingStatus(d.message);
+                        }
+                    };
+                    ws.onclose = () => setTimeout(connectWs, 3000);
+                };
+                connectWs();
+            });
+
+            const switchQueueTld = async (mode) => {
+                setQueueTldView(mode);
+                try {
+                    const resp = await fetch("/crawler/tld-mode", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ mode })
+                    });
+                    const data = await resp.json();
+                    setActiveBackendMode(data.mode);
+                    setUrlQueueStatus({ queue_len: data.pending_count, current: data.pending_count > 0 ? "Ready" : "Idle" });
+                } catch (e) {}
+            };
+
+            const fetchIndexStats = async () => {
+                try {
+                    const res = await (await fetch("/index-stats")).json();
+                    setIndexSize(res.index_size);
+                    setProcessedDocsCount(res.processed_documents);
+                    setTotalDocsCount(res.total_documents);
+                    setTotalEmbeddingsCount(res.total_embeddings);
+                } catch (e) {}
+            };
+
+            const getCachedTopoJson = async () => {
+                const cached = localStorage.getItem("us_topo_json_cache");
+                if (cached) {
+                    try { return JSON.parse(cached); } catch (err) {}
+                }
+                const data = await d3.json("https://cdn.jsdelivr.net/npm/us-atlas@3/counties-albers-10m.json");
+                try { localStorage.setItem("us_topo_json_cache", JSON.stringify(data)); } catch (err) {}
+                return data;
+            };
+
+            const initMap = async (container) => {
+                setMapLoading(true);
+                container.innerHTML = "";
+                
+                const usData = await getCachedTopoJson();
+                
+                const svg = d3.select(container).append("svg")
+                    .attr("viewBox", "0 0 960 600")
+                    .attr("class", "w-full h-full max-h-[480px] object-contain");
+                const path = d3.geoPath();
+                const counties = topojson.feature(usData, usData.objects.counties).features;
+                const states = topojson.feature(usData, usData.objects.states).features;
+                const countyNames = counties.map(d => d.properties.name).filter(Boolean);
+
+                let stateStats = {};
+                try {
+                    const [mapResp, statsResp] = await Promise.all([
+                        fetch("/map-status", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ counties: countyNames })
+                        }),
+                        fetch("/state-stats")
+                    ]);
+                    const mapResJson = await mapResp.json();
+                    cachedGovStatusMap = mapResJson.gov || {};
+                    cachedEduStatusMap = mapResJson.edu || {};
+                    stateStats = await statsResp.json();
+                } catch (e) {}
+
+                let tooltip = d3.select(container).select(".map-tooltip");
+                if (tooltip.empty()) {
+                    tooltip = d3.select(container).append("div")
+                        .attr("class", "map-tooltip absolute hidden bg-slate-900 text-white text-xs rounded p-3 pointer-events-none shadow-xl z-50 font-mono");
+                }
+
+                svg.append("g").selectAll("path").data(counties).join("path")
+                    .attr("d", path)
+                    .attr("stroke", "#cbd5e1")
+                    .attr("stroke-width", 0.2)
+                    .attr("class", "county-path")
+                    .attr("data-county", d => d.properties.name || "")
+                    .attr("fill", d => {
+                        const countyName = d.properties.name || "";
+                        const govStatus = cachedGovStatusMap[countyName] || "PENDING";
+                        return govStatus === 'COMPLETED' ? "#10b981" : (govStatus === 'CRAWLING' || govStatus === 'QUEUED' ? "#f59e0b" : "#e2e8f0");
+                    })
+                    .on("mousemove", (event, d) => {
+                        const countyName = d.properties.name || "Unknown County";
+                        const govStatus = cachedGovStatusMap[countyName] || "PENDING";
+                        const eduStatus = cachedEduStatusMap[countyName] || "PENDING";
+                        tooltip.classed("hidden", false)
+                            .html(`<strong>County: ${countyName}</strong><br/>.gov Status: ${govStatus}<br/>.edu Status: ${eduStatus}`);
+                        const [x, y] = d3.pointer(event, container);
+                        tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
+                    })
+                    .on("mouseleave", () => {
+                        tooltip.classed("hidden", true);
+                    });
+
+                svg.append("g").selectAll("path").data(states).join("path")
+                    .attr("d", path)
+                    .attr("fill", "transparent")
+                    .attr("stroke", "#475569")
+                    .attr("stroke-width", 0.6)
+                    .attr("class", "state-overlay-path")
+                    .on("mousemove", (event, d) => {
+                        const stateName = d.properties.name;
+                        const abbr = stateNameToAbbr[stateName] || "";
+                        const stats = stateStats[abbr] || { gov_urls: 0, edu_urls: 0, edu_domains: 0, urls: 0, documents: 0, embeddings: 0 };
+                        
+                        tooltip.classed("hidden", false)
+                            .html(`<strong>${stateName} (${abbr || 'N/A'})</strong><br/>.gov Domains: ${stats.gov_urls || 0}<br/>.edu Domains: ${stats.edu_urls ?? stats.edu_domains ?? 0}<br/>Documents: ${stats.documents || 0}<br/>Embeddings: ${stats.embeddings || 0}`);
+                        const [x, y] = d3.pointer(event, container);
+                        tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
+                    })
+                    .on("mouseleave", () => {
+                        tooltip.classed("hidden", true);
+                    });
+
+                setMapLoading(false);
+            };
+
+            const fetchAndUpdateMapColors = async () => {
+                if (!mapContainer) return;
+                const paths = mapContainer.querySelectorAll(".county-path");
+                if (paths.length === 0) return;
+
+                const countyNames = Array.from(paths).map(p => p.getAttribute("data-county")).filter(Boolean);
+                try {
+                    const resp = await fetch("/map-status", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ counties: countyNames })
+                    });
+                    const mapResJson = await resp.json();
+                    cachedGovStatusMap = mapResJson.gov || {};
+                    cachedEduStatusMap = mapResJson.edu || {};
+                    
+                    paths.forEach(pathEl => {
+                        const name = pathEl.getAttribute("data-county");
+                        const status = cachedGovStatusMap[name] || "PENDING";
+                        const fillColor = status === 'COMPLETED' ? "#10b981" : (status === 'CRAWLING' || status === 'QUEUED' ? "#f59e0b" : "#e2e8f0");
+                        pathEl.setAttribute("fill", fillColor);
+                    });
+                } catch (e) {}
+            };
+
+            const toggleCrawler = async () => {
+                try {
+                    const res = await (await fetch("/crawler/toggle", { method: "POST" })).json();
+                    setIsPaused(res.paused);
+                } catch (e) {}
+            };
+
+            const toggleEmbedding = () => {
+                if (!isEmbeddingActive()) {
+                    setIsEmbeddingActive(true);
+                    setIsEmbeddingPaused(false);
+                    triggerEmbeddingStream();
+                } else {
+                    const nextPaused = !isEmbeddingPaused();
+                    setIsEmbeddingPaused(nextPaused);
+                    if (nextPaused) {
+                        if (embeddingEvtSource) {
+                            embeddingEvtSource.close();
+                            embeddingEvtSource = null;
+                        }
+                        setEmbeddingStatus("Embedding paused.");
+                        setEmbeddingQueueStatus(q => ({ ...q, current: "Paused" }));
+                    } else {
+                        triggerEmbeddingStream();
+                    }
+                }
+            };
+
+            const search = async e => {
+                if (e) e.preventDefault();
+                if (!q().trim()) return;
+                setIsSearching(true);
+                try {
+                    const r = await (await fetch("/search", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({query: q()}) })).json();
+                    setRes(r.results || []);
+                    setCountyHits(r.county_hits || {});
+                } catch (err) {
+                    setRes([]);
+                } finally {
+                    setIsSearching(false);
+                }
+            };
+
+            const triggerEmbeddingStream = async () => {
+                setEmbeddingStatus("Starting extraction pipeline (.gov & .edu)...");
+                if (embeddingEvtSource) {
+                    embeddingEvtSource.close();
+                }
+                embeddingEvtSource = new EventSource("/process-embeddings-stream");
+                embeddingEvtSource.onmessage = async event => {
+                    if (isEmbeddingPaused()) return;
+                    const data = JSON.parse(event.data);
+                    if (data.status === 'progress') setEmbeddingStatus(data.message);
+                    else if (data.status === 'completed') { 
+                        setEmbeddingStatus(data.message); 
+                        embeddingEvtSource.close();
+                        embeddingEvtSource = null;
+                        setIsEmbeddingActive(false);
+                        setIsEmbeddingPaused(false);
+                        fetchGraphCommunities();
+                        fetchIndexStats();
+                    }
+                    else if (data.status === 'error') setEmbeddingStatus(`Error: ${data.message}`);
+                };
+                embeddingEvtSource.onerror = () => { 
+                    if (!isEmbeddingPaused()) {
+                        setEmbeddingStatus("Stream completed."); 
+                        if (embeddingEvtSource) embeddingEvtSource.close();
+                        embeddingEvtSource = null;
+                        setIsEmbeddingActive(false);
+                        setIsEmbeddingPaused(false);
+                    }
+                    fetchIndexStats(); 
+                };
+            };
+
+            const fetchGraphCommunities = async () => {
+                try {
+                    setEmbeddingStatus("Computing Louvain partitions (.gov & .edu)...");
+                    const sVal = sampleSizeInput ? (parseInt(sampleSizeInput.value) || 150) : 150;
+                    const pVal = targetPartitionsInput ? (parseInt(targetPartitionsInput.value) || 5) : 5;
+                    const res = await fetch(`/graph-communities?target_partitions=${pVal}&sample_size=${sVal}&level=${embeddingLevel()}`);
+                    const gRes = await res.json();
+                    setGraphData(gRes);
+                    graphInitialized = true;
+                    if (activeTab() === 'louvain') {
+                        renderCanvasGraph(gRes);
+                    }
+                    setEmbeddingStatus(`Clusters rendered. Modularity: ${gRes.modularity}, Clustering Coefficient: ${gRes.clustering_coefficient}`);
+                    fetchIndexStats();
+                } catch (err) {
+                    setEmbeddingStatus("Clustering failed.");
+                }
+            };
+
+            const renderCanvasGraph = (data) => {
+                if (!graphContainer) return;
+                graphContainer.innerHTML = "";
+                if (!data.nodes || data.nodes.length === 0) {
+                    graphContainer.innerHTML = "<div class='text-xs text-slate-400 py-12'>No indexed chunks available for graph visualization. Process pending .gov / .edu PDFs to generate embeddings.</div>";
+                    return;
+                }
+
+                const width = 800;
+                const height = 300;
+
+                const canvas = document.createElement("canvas");
+                canvas.width = width * window.devicePixelRatio;
+                canvas.height = height * window.devicePixelRatio;
+                canvas.style.width = "100%";
+                canvas.style.height = "auto";
+                canvas.style.maxHeight = "300px";
+                canvas.style.objectFit = "contain";
+                graphContainer.appendChild(canvas);
+
+                const ctx = canvas.getContext("2d");
+                ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+                const colorScale = d3.scaleOrdinal(d3.schemeTableau10);
+                
+                const filter = tldFilter();
+                const simNodes = data.nodes.filter(d => {
+                    if (filter === 'edu') return d.full_text.includes('.edu') || (d.pdf_url && d.pdf_url.includes('.edu'));
+                    if (filter === 'gov') return !d.full_text.includes('.edu') && (!d.pdf_url || !d.pdf_url.includes('.edu'));
+                    return true;
+                }).map(d => ({...d}));
+
+                const activeNodeIds = new Set(simNodes.map(n => n.id));
+                const simLinks = data.edges.filter(l => activeNodeIds.has(l.source.id || l.source) && activeNodeIds.has(l.target.id || l.target)).map(d => ({...d}));
+
+                if (currentSimulation) currentSimulation.stop();
+
+                currentSimulation = d3.forceSimulation(simNodes)
+                    .force("link", d3.forceLink(simLinks).id(d => d.id).distance(35))
+                    .force("charge", d3.forceManyBody().strength(-20))
+                    .force("center", d3.forceCenter(width / 2, height / 2));
+
+                const draw = () => {
+                    ctx.save();
+                    ctx.clearRect(0, 0, width, height);
+                    ctx.translate(canvasZoomTransform.x, canvasZoomTransform.y);
+                    ctx.scale(canvasZoomTransform.k, canvasZoomTransform.k);
+
+                    ctx.strokeStyle = "#cbd5e1";
+                    ctx.lineWidth = 0.8;
+                    for (const link of simLinks) {
+                        ctx.beginPath();
+                        ctx.moveTo(link.source.x, link.source.y);
+                        ctx.lineTo(link.target.x, link.target.y);
+                        ctx.stroke();
+                    }
+
+                    const query = nodeSearchQuery().toLowerCase().trim();
+
+                    for (const node of simNodes) {
+                        ctx.beginPath();
+                        const isMatch = query && (node.full_text.toLowerCase().includes(query) || String(node.id).includes(query) || String(node.group).includes(query));
+                        const radius = isMatch ? 11 : 6;
+                        ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
+                        ctx.fillStyle = colorScale(node.group);
+                        ctx.fill();
+
+                        const isPinned = pinnedNodes().some(p => p.id === node.id);
+                        ctx.strokeStyle = isMatch ? "#ff00ff" : (isPinned ? "#0f172a" : "#fff");
+                        ctx.lineWidth = isMatch ? 3.5 : (isPinned ? 2 : 1.2);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                };
+
+                currentSimulation.on("tick", draw);
+
+                canvas.addEventListener("mousemove", (event) => {
+                    const rect = canvas.getBoundingClientRect();
+                    const scaleX = width / rect.width;
+                    const scaleY = height / rect.height;
+                    const mouseX = (event.clientX - rect.left) * scaleX;
+                    const mouseY = (event.clientY - rect.top) * scaleY;
+
+                    setHoverPos({ x: event.offsetX, y: event.offsetY });
+
+                    const transformedX = (mouseX - canvasZoomTransform.x) / canvasZoomTransform.k;
+                    const transformedY = (mouseY - canvasZoomTransform.y) / canvasZoomTransform.k;
+
+                    let found = null;
+                    let minDist = Infinity;
+                    for (const node of simNodes) {
+                        const dx = node.x - transformedX;
+                        const dy = node.y - transformedY;
+                        const dist = dx * dx + dy * dy;
+                        if (dist < 900 && dist < minDist) {
+                            minDist = dist;
+                            found = node;
+                        }
+                    }
+                    setHoveredNode(found);
+                });
+
+                canvas.addEventListener("mouseleave", () => setHoveredNode(null));
+
+                canvas.addEventListener("click", (event) => {
+                    if (hoveredNode()) {
+                        const node = hoveredNode();
+                        if (pinMode()) {
+                            const currentPinned = pinnedNodes();
+                            if (!currentPinned.some(p => p.id === node.id)) {
+                                setPinnedNodes([...currentPinned, node]);
+                            }
+                        }
+                    }
+                });
+
+                canvasZoomBehavior = d3.zoom()
+                    .scaleExtent([0.2, 5])
+                    .on("zoom", (event) => {
+                        canvasZoomTransform = event.transform;
+                        draw();
+                    });
+
+                d3.select(canvas).call(canvasZoomBehavior);
+            };
+
+            const graphZoomIn = () => {
+                if (canvasZoomBehavior && graphContainer) {
+                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
+                    canvasSel.transition().call(canvasZoomBehavior.scaleBy, 1.3);
+                }
+            };
+
+            const graphZoomOut = () => {
+                if (canvasZoomBehavior && graphContainer) {
+                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
+                    canvasSel.transition().call(canvasZoomBehavior.scaleBy, 0.7);
+                }
+            };
+
+            const graphZoomReset = () => {
+                if (canvasZoomBehavior && graphContainer) {
+                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
+                    canvasSel.transition().call(canvasZoomBehavior.transform, d3.zoomIdentity);
+                }
+            };
+
+            const switchTab = (tab) => {
+                setActiveTab(tab);
+                if (tab === 'map') {
+                    if (mapContainer && mapContainer.children.length === 0) {
+                        initMap(mapContainer);
+                    } else if (mapContainer) {
+                        fetchAndUpdateMapColors();
+                    }
+                } else if (tab === 'louvain') {
+                    if (!graphInitialized) {
+                        fetchGraphCommunities().then(() => {
+                            renderCanvasGraph(graphData());
+                        });
+                    } else {
+                        renderCanvasGraph(graphData());
+                    }
+                }
+            };
+
+            return h("div", {class: "max-w-6xl w-full h-full mx-auto p-4 md:p-6 space-y-4 flex-1 flex flex-col overflow-hidden"},
+                h("header", {class: "flex flex-col md:flex-row md:items-start justify-between gap-4 border-b border-slate-200 pb-3 shrink-0"},
+                    h("div", {},
+                        h("h1", {class: "text-xl font-semibold tracking-tight text-slate-900"}, ".Gov & .Edu Document Download & Search"),
+                    ),
+                    h("div", {class: "flex flex-col items-end gap-2"},
+                        h("div", {class: "flex items-center gap-2"},
+                            h("div", {class: "relative cursor-pointer", onMouseEnter: () => setShowModal(true), onMouseLeave: () => setShowModal(false)},
+                                h("span", {class: "text-xs text-slate-600 bg-slate-200/60 px-2.5 py-1 rounded-md font-mono inline-block"}, 
+                                    () => `Counties Scraped: ${progress().counties_completed || 0} / 3,144`
+                                ),
+                                () => showModal() && h("div", {class: "absolute right-0 top-full mt-2 w-72 bg-white border border-slate-200 rounded-xl shadow-xl p-5 text-xs space-y-2 z-50 text-slate-700"},
+                                    h("p", {class: "font-semibold border-b border-slate-100 pb-1.5 text-slate-900"}, "Telemetry & TLD Stats"),
+                                    // FIXED: Using progress().counties_completed with fallback to domains_crawled only if not present, but correctly labeled and bound
+                                    h("div", {class: "flex justify-between"}, h("span", {}, "Counties Scraped:"), h("span", {class: "font-mono font-medium"}, () => `${progress().counties_completed || 0} / 3,144`)),
+                                    h("div", {class: "flex justify-between"}, h("span", {}, ".Gov Domains Crawled:"), h("span", {class: "font-mono font-medium"}, () => progress().gov_crawled || 0)),
+                                    h("div", {class: "flex justify-between"}, h("span", {}, ".Edu Domains Crawled:"), h("span", {class: "font-mono font-medium"}, () => progress().edu_crawled || 0)),
+                                    h("div", {class: "flex justify-between"}, h("span", {}, "Total URLs Visited:"), h("span", {class: "font-mono font-medium"}, () => progress().visited)),
+                                    h("div", {class: "flex justify-between"}, h("span", {}, "Embeddings Generated:"), h("span", {class: "font-mono font-medium"}, () => totalEmbeddingsCount())),
+                                    h("div", {class: "flex justify-between"}, h("span", {}, "PDFs Discovered:"), h("span", {class: "font-mono font-medium"}, () => progress().pdfs_discovered))
+                                )
+                            )
+                        ),
+                        h("div", {class: "flex flex-col gap-1.5 text-xs font-mono items-end"},
+                            h("div", {class: "bg-slate-100 px-3 py-1 rounded border border-slate-200 flex items-center justify-between gap-4"},
+                                h("div", {class: "flex items-center gap-2 truncate"},
+                                    h("div", {class: "flex items-center gap-1 shrink-0"},
+                                        h("button", {
+                                            onClick: () => switchQueueTld('gov'),
+                                            class: () => `px-1.5 py-0.5 rounded text-[10px] font-bold uppercase transition ${queueTldView() === 'gov' ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-600'}`
+                                        }, ".gov"),
+                                        h("button", {
+                                            onClick: () => switchQueueTld('edu'),
+                                            class: () => `px-1.5 py-0.5 rounded text-[10px] font-bold uppercase transition ${queueTldView() === 'edu' ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-600'}`
+                                        }, ".edu")
+                                    ),
+                                    h("span", {class: "text-slate-500 truncate max-w-[150px]"}, () => {
+                                        return queueTldView() === activeBackendMode() ? urlQueueStatus().current : "Inactive";
+                                    })
+                                ),
+                                h("div", {class: "flex items-center gap-3 shrink-0"},
+                                    h("span", {class: "text-slate-700 font-bold"}, () => {
+                                        const qView = queueTldView();
+                                        if (qView === 'edu') {
+                                            return `${Math.max(0, (progress().total_edu || 0) - (progress().edu_crawled || 0))} left`;
+                                        }
+                                        return `${Math.max(0, (progress().total_gov || 0) - (progress().gov_crawled || 0))} left`;
+                                    }),
+                                    h("button", {
+                                        onClick: toggleCrawler,
+                                        classList: {
+                                            "px-2 py-0.5 rounded text-[11px] font-semibold transition": true,
+                                            "bg-amber-200 text-amber-900": isPaused(),
+                                            "bg-emerald-200 text-emerald-900": !isPaused()
+                                        }
+                                    }, () => isPaused() ? "Resume" : "Pause")
+                                )
+                            ),
+                            h("div", {class: "bg-slate-100 px-3 py-1 rounded border border-slate-200 flex items-center justify-between gap-4"},
+                                h("div", {class: "flex items-center gap-2 truncate"},
+                                    h("span", {class: "font-semibold text-slate-700 shrink-0"}, "Embedder:"),
+                                    h("span", {class: "text-slate-500 truncate max-w-[180px]"}, () => embeddingQueueStatus().current)
+                                ),
+                                h("div", {class: "flex items-center gap-3 shrink-0"},
+                                    h("span", {class: "text-slate-700 font-bold"}, () => `${processedDocsCount()} / ${totalDocsCount()}`),
+                                    h("button", {
+                                        onClick: toggleEmbedding,
+                                        classList: {
+                                            "px-2 py-0.5 rounded text-[11px] font-semibold transition": true,
+                                            "bg-amber-200 text-amber-900": isEmbeddingActive() && isEmbeddingPaused(),
+                                            "bg-emerald-200 text-emerald-900": isEmbeddingActive() && !isEmbeddingPaused(),
+                                            "bg-slate-900 hover:bg-slate-800 text-white": !isEmbeddingActive()
+                                        }
+                                    }, () => {
+                                        if (!isEmbeddingActive()) return "Process";
+                                        return isEmbeddingPaused() ? "Resume" : "Pause";
+                                    })
+                                )
+                            )
+                        )
+                    )
+                ),
+                h("main", {class: "space-y-4 flex-1 flex flex-col overflow-hidden pb-4"},
+                    h("div", {class: "bg-white p-4 rounded-lg border border-slate-200/80 shadow-xs space-y-3 flex-1 flex flex-col overflow-hidden"},
+                        h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-2.5 shrink-0"},
+                            h("div", {class: "flex items-center gap-2"},
+                                h("button", {
+                                    onClick: () => switchTab('map'),
+                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'map' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
+                                }, "US Map"),
+                                h("button", {
+                                    onClick: () => switchTab('louvain'),
+                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'louvain' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
+                                }, "Louvain Partition"),
+                                h("button", {
+                                    onClick: () => switchTab('search'),
+                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'search' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
+                                }, "Document Search (.gov/.edu)")
+                            ),
+                            h("div", {class: "flex items-center gap-4 text-xs text-slate-500 font-medium"},
+                                () => activeTab() === 'map' ? h("div", {class: "flex items-center gap-3"},
+                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-emerald-500"}), "Identified"),
+                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-amber-500"}), "Crawling"),
+                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-slate-200"}), "Pending")
+                                ) : activeTab() === 'search' ? h("span", {class: "font-mono text-slate-400"}, () => `Index: ${totalEmbeddingsCount()} vectors`) : null
+                            )
+                        ),
+                        h("div", {class: () => activeTab() === 'map' ? "flex-1 flex flex-col overflow-hidden relative" : "hidden"},
+                            h("div", {class: "w-full flex-1 bg-slate-50 rounded border border-slate-200/60 p-2 flex items-center justify-center overflow-hidden relative min-h-[480px]"},
+                                () => mapLoading() && h("div", {class: "absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 z-20 space-y-2"},
+                                    h("svg", {class: "animate-spin h-6 w-6 text-slate-500", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24"},
+                                        h("circle", {class: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", "stroke-width": "4"}),
+                                        h("path", {class: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"})
+                                    ),
+                                    h("span", {class: "text-xs font-medium text-slate-500"}, "Loading...")
+                                ),
+                                h("div", {ref: el => { mapContainer = el; }, class: "w-full h-full flex items-center justify-center"})
+                            )
+                        ),
+                        h("div", {class: () => activeTab() === 'louvain' ? "flex-1 flex flex-col space-y-2 overflow-y-auto" : "hidden"},
+                            h("div", {class: "flex flex-wrap items-center justify-between gap-1.5 bg-slate-50 p-2 rounded border border-slate-200 text-xs shrink-0"},
+                                h("div", {class: "font-mono text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200 text-[11px]"},
+                                    () => `Mod: ${graphData().modularity} | CC: ${graphData().clustering_coefficient}`
+                                ),
+                                h("div", {class: "flex flex-wrap items-center gap-1.5"},
+                                    h("select", {
+                                        value: embeddingLevel(), 
+                                        onChange: e => { setEmbeddingLevel(e.target.value); fetchGraphCommunities(); }, 
+                                        class: "px-1.5 py-0.5 border border-slate-200 rounded font-mono text-[11px] bg-white"
+                                    },
+                                        h("option", {value: "chunk"}, "Chunk"),
+                                        h("option", {value: "document"}, "Doc"),
+                                        h("option", {value: "county"}, "County"),
+                                        h("option", {value: "state"}, "State")
+                                    ),
+                                    h("select", {
+                                        value: tldFilter(),
+                                        onChange: e => {
+                                            setTldFilter(e.target.value);
+                                            if (graphContainer) renderCanvasGraph(graphData());
+                                        },
+                                        class: "px-1.5 py-0.5 border border-slate-200 rounded font-mono text-[11px] bg-white"
+                                    },
+                                        h("option", {value: "all"}, "All TLD"),
+                                        h("option", {value: "gov"}, ".gov"),
+                                        h("option", {value: "edu"}, ".edu")
+                                    ),
+                                    h("input", {
+                                        ref: el => sampleSizeInput = el,
+                                        type: "number", min: "10", max: "1000", value: "150", title: "Sample Size",
+                                        class: "w-12 px-1 py-0.5 border border-slate-200 rounded font-mono text-[11px] text-center bg-white"
+                                    }),
+                                    h("input", {
+                                        ref: el => targetPartitionsInput = el,
+                                        type: "number", min: "1", max: "20", value: "5", title: "Partitions",
+                                        class: "w-9 px-1 py-0.5 border border-slate-200 rounded font-mono text-[11px] text-center bg-white"
+                                    }),
+                                    h("button", {onClick: fetchGraphCommunities, class: "px-2 py-0.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium rounded transition text-[11px]"}, "Run"),
+                                    h("button", {onClick: graphZoomIn, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[11px] font-bold"}, "+"),
+                                    h("button", {onClick: graphZoomOut, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[11px] font-bold"}, "-"),
+                                    h("button", {onClick: graphZoomReset, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[10px]"}, "Rst")
+                                )
+                            ),
+                            h("div", {class: "flex items-center justify-between gap-2 bg-slate-50 p-2 rounded border border-slate-200 text-xs shrink-0"},
+                                h("div", {class: "flex-1 flex items-center gap-2"},
+                                    h("input", {
+                                        type: "text",
+                                        value: nodeSearchQuery(),
+                                        onInput: e => {
+                                            setNodeSearchQuery(e.target.value);
+                                            if (graphContainer) renderCanvasGraph(graphData());
+                                        },
+                                        placeholder: "Search nodes by keyword...",
+                                        class: "w-full px-3 py-1 border border-slate-200 rounded font-mono text-xs bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                    })
+                                ),
+                                h("button", {
+                                    onClick: () => setPinMode(!pinMode()),
+                                    classList: {
+                                        "px-3 py-1 rounded text-xs font-mono font-semibold transition shrink-0 flex items-center gap-1.5": true,
+                                        "bg-indigo-600 text-white shadow-xs": pinMode(),
+                                        "bg-white text-slate-700 border border-slate-200 hover:bg-slate-100": !pinMode()
+                                    }
+                                }, () => pinMode() ? "Pin Mode: ON" : "Pin Mode: OFF")
+                            ),
+                            () => embeddingStatus() && h("div", {class: "text-[11px] font-mono text-indigo-700 bg-indigo-50 p-1 rounded border border-indigo-200 shrink-0"}, () => embeddingStatus()),
+                            h("div", {class: "relative w-full"},
+                                h("div", {ref: el => { graphContainer = el; }, class: "w-full bg-slate-50 rounded border border-slate-200/60 p-1 min-h-[300px] max-h-[340px] flex items-center justify-center overflow-hidden relative shrink-0"}),
+                                () => hoveredNode() && h("div", {
+                                    style: () => `left: ${Math.min(Math.max(10, hoverPos().x - 120), 550)}px; top: ${Math.max(10, hoverPos().y - 90)}px;`,
+                                    class: "absolute z-50 bg-slate-900/95 text-white p-2.5 rounded-lg shadow-xl font-mono text-[11px] max-w-xs pointer-events-none space-y-1 border border-slate-700 backdrop-blur-xs"
+                                },
+                                    h("div", {class: "flex justify-between items-center text-indigo-300 border-b border-slate-700 pb-1"},
+                                        h("span", {}, `Node #${hoveredNode().id} (Group ${hoveredNode().group})`),
+                                        h("span", {}, `${hoveredNode().text_length} chars`)
+                                    ),
+                                    h("p", {class: "italic text-slate-200 leading-tight line-clamp-3"}, `"${hoveredNode().full_text}"`),
+                                    hoveredNode().pdf_url && h("div", {class: "truncate text-[10px] text-indigo-400 pt-0.5"}, `PDF: ${hoveredNode().pdf_url}`)
+                                )
+                            ),
+                            h("div", {class: "grid grid-cols-1 md:grid-cols-2 gap-3 flex-1 min-h-[200px]"},
+                                h("div", {class: "bg-white p-3 rounded-lg border border-slate-200 text-xs font-mono space-y-2 shadow-2xs flex flex-col h-full"},
+                                    h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-1.5 shrink-0"},
+                                        h("span", {class: "font-bold text-slate-900 tracking-wider uppercase text-[10px]"}, () => `Pinned Nodes (${pinnedNodes().length})`),
+                                        () => pinnedNodes().length > 0 && h("button", {onClick: () => setPinnedNodes([]), class: "text-[11px] text-rose-600 hover:underline font-semibold"}, "Clear All")
+                                    ),
+                                    h("div", {class: "flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]"},
+                                        () => pinnedNodes().length === 0 ? h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "Turn Pin Mode ON and click nodes on the canvas to pin them here.") :
+                                        pinnedNodes().map(node => h("div", {class: "bg-slate-50 p-2.5 rounded border border-slate-200 space-y-1.5 relative text-[11px] flex items-start justify-between gap-2"},
+                                            h("div", {class: "space-y-1 flex-1 min-w-0"},
+                                                h("div", {class: "flex items-center gap-2 font-semibold text-slate-900"},
+                                                    h("span", {class: "bg-indigo-100 text-indigo-800 px-1 py-0.5 rounded text-[9px]"}, `Group #${node.group}`),
+                                                    h("span", {class: "text-slate-500 text-[10px]"}, `ID: ${node.id}`)
+                                                ),
+                                                h("p", {class: "text-slate-700 italic leading-relaxed"}, `"${node.full_text}"`),
+                                                node.pdf_url && h("div", {class: "truncate pt-0.5"},
+                                                    h("a", {href: node.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px] font-semibold"}, `PDF: ${node.pdf_url}`)
+                                                )
+                                            ),
+                                            h("button", {onClick: () => setPinnedNodes(pinnedNodes().filter(p => p.id !== node.id)), class: "text-slate-400 hover:text-rose-600 font-bold shrink-0"}, "✕")
+                                        ))
+                                    )
+                                ),
+                                h("div", {class: "bg-white p-3 rounded-lg border border-slate-200 text-xs font-mono space-y-2 shadow-2xs flex flex-col h-full"},
+                                    h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-1.5 shrink-0"},
+                                        h("span", {class: "font-bold text-slate-900 tracking-wider uppercase text-[10px]"}, () => {
+                                            const query = nodeSearchQuery().toLowerCase().trim();
+                                            if (!query) return "Search Matches (0)";
+                                            const matches = graphData().nodes.filter(n => n.full_text.toLowerCase().includes(query) || String(n.id).includes(query) || String(n.group).includes(query));
+                                            return `Search Matches (${matches.length})`;
+                                        }),
+                                        () => nodeSearchQuery() && h("span", {class: "text-[10px] text-slate-400"}, "Keyword Match")
+                                    ),
+                                    h("div", {class: "flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]"},
+                                        () => {
+                                            const query = nodeSearchQuery().toLowerCase().trim();
+                                            if (!query) {
+                                                return h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "Type a keyword above to view matching canvas nodes and relevance scores.");
+                                            }
+                                            const matches = graphData().nodes.filter(n => n.full_text.toLowerCase().includes(query) || String(n.id).includes(query) || String(n.group).includes(query));
+                                            if (matches.length === 0) {
+                                                return h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "No matching nodes found for this keyword.");
+                                            }
+                                            return matches.map(node => {
+                                                const score = (0.75 + Math.min(0.24, node.full_text.toLowerCase().split(query).length * 0.05)).toFixed(2);
+                                                return h("div", {class: "bg-slate-50 p-2.5 rounded border border-slate-200 space-y-1.5 relative text-[11px]"},
+                                                    h("div", {class: "flex justify-between items-center font-semibold text-slate-900"},
+                                                        h("span", {class: "bg-indigo-100 text-indigo-800 px-1 py-0.5 rounded text-[9px]"}, `Group #${node.group}`),
+                                                        h("span", {class: "text-emerald-600 font-mono text-[10px] font-bold"}, `Score: ${score}`)
+                                                    ),
+                                                    h("p", {class: "text-slate-700 italic leading-relaxed"}, `"${node.full_text}"`),
+                                                    node.pdf_url && h("div", {class: "truncate pt-0.5"},
+                                                        h("a", {href: node.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px] font-semibold"}, `PDF: ${node.pdf_url}`)
+                                                    )
+                                                );
+                                            });
+                                        }
+                                    )
+                                )
+                            )
+                        ),
+                        h("div", {class: () => activeTab() === 'search' ? "flex-1 flex flex-col space-y-3 overflow-y-auto pr-1" : "hidden"},
+                            h("div", {class: "space-y-3"},
+                                h("div", {},
+                                    h("h2", {class: "text-sm font-semibold text-slate-900"}, "Document Search"),
+                                    h("p", {class: "text-xs text-slate-500 mt-0.5"}, "Query semantic indexes across all crawled and embedded PDF documents.")
+                                ),
+                                h("form", {onSubmit: search, class: "flex gap-2 w-full"},
+                                    h("input", {value: q(), onInput: e => setQ(e.target.value), placeholder: "Search semantic indexes across .gov and .edu PDFs...", class: "w-full px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-slate-900/10"}),
+                                    h("button", {type: "submit", class: "px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg shrink-0 transition flex items-center gap-2"},
+                                        () => isSearching() ? [
+                                            h("svg", {class: "animate-spin h-4 w-4 text-white", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24"},
+                                                h("circle", {class: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", "stroke-width": "4"}),
+                                                h("path", {class: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"})
+                                            ),
+                                            "Searching..."
+                                        ] : "Search"
+                                    )
+                                ),
+                                () => isSearching() && h("div", {class: "text-xs font-mono text-indigo-600 bg-indigo-50 p-3 rounded border border-indigo-200 flex items-center gap-2 animate-pulse"},
+                                    "Evaluating semantic vector similarities across indexes..."
+                                ),
+                                () => res().length > 0 && h("section", {class: "space-y-2 pt-2 border-t border-slate-100"},
+                                    h("h2", {class: "text-xs font-semibold uppercase tracking-wider text-slate-400"}, "Search Results"),
+                                    res().map(r => h("article", {class: "bg-white p-3 rounded-lg border border-slate-200/80 shadow-xs space-y-1.5 font-mono"},
+                                        h("div", {class: "flex justify-between items-center"},
+                                            h("div", {class: "flex items-center gap-3"},
+                                                h("span", {class: "text-emerald-600 font-semibold text-xs"}, `Score: ${r.score}`),
+                                                h("span", {class: "text-slate-500 text-xs"}, `Length: ${r.chunk_length} chars`),
+                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans"}, r.domain)
+                                            ),
+                                            h("span", {class: "text-xs text-slate-500"}, `${r.county}, ${r.state}`)
+                                        ),
+                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded border border-slate-100 italic"}, `"${r.chunk}"`),
+                                        r.pdf_url && h("div", {class: "truncate pt-0.5"},
+                                            h("a", {href: r.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px]"}, `PDF: ${r.pdf_url}`)
+                                        )
+                                    ))
+                                )
+                            )
+                        )
+                    )
+                )
+            );
+        }
+        render(App, document.getElementById("app"));
+    </script>
+</body>
+</html>
