@@ -4,8 +4,7 @@
 !index.html
 !main.py
 !docker-compose.yml
-!s4/index.jsx
-!s4/s4.c
-!s4/s4.h 
-!s4/serverless_funtions_gateway.dart
-!*.png
+!./s4/index.jsx
+!./s4/s4.c
+!./s4/s4.h 
+!./s4/serverless_funtions_gateway.dart
