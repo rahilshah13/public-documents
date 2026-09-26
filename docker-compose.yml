@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -15,6 +17,192 @@ services:
       timeout: 5s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_gemma
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    restart: unless-stopped
+
+  s4_gateway:
+    build:
+      context: ./s4
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1.6
+        FROM alpine:3.19 AS builder
+        RUN apk add --no-cache gcc musl-dev sqlite-dev make git libev-dev
+        WORKDIR /app
+        COPY s4.h .
+        COPY s4.c .
+        RUN gcc -O2 s4.c -lpthread -lsqlite3 -o s4_daemon
+        FROM alpine:3.19
+        RUN apk add --no-cache sqlite-libs libev
+        WORKDIR /app
+        COPY --from=builder /app/s4_daemon /app/s4_daemon
+        EXPOSE 8080
+        CMD ["/app/s4_daemon"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  s4_ui:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM alpine:3.20
+
+        RUN apk add --no-cache python3 py3-pip py3-requests git nodejs npm
+        RUN WITH_EXTENSION=0 python3 -m pip install --no-cache-dir --break-system-packages mwparserfromhell==0.7.2
+
+        WORKDIR /S4_UI_SRC
+
+        RUN cat <<'EOF' > abbr_map.json
+        {
+          "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+          "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
+          "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+          "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+          "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO",
+          "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ",
+          "New Mexico": "NM", "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
+          "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+          "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
+          "Virginia": "VA", "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+          "District of Columbia": "DC"
+        }
+        EOF
+
+        RUN cat <<'EOF' > package.json
+        {
+          "name": "s4-provider-ui",
+          "type": "module",
+          "scripts": {
+            "dev": "vinxi dev",
+            "build": "vinxi build",
+            "start": "vinxi start"
+          },
+          "dependencies": {
+            "@solidjs/meta": "^0.29.4",
+            "@solidjs/router": "^0.15.3",
+            "@solidjs/start": "^1.0.10",
+            "solid-js": "^1.9.3",
+            "vinxi": "^0.5.7"
+          }
+        }
+        EOF
+        RUN npm install
+
+        COPY . /S4_UI_SRC
+
+        RUN cat <<'EOF' > app.config.js
+        import { defineConfig } from "@solidjs/start/config";
+        export default defineConfig({
+          server: {
+            compressPublicAssets: false,
+            experimental: { asyncContext: true }
+          }
+        });
+        EOF
+
+        RUN mkdir -p src/routes
+        RUN if [ -f s4/index.jsx ]; then cp s4/index.jsx src/routes/index.jsx; elif [ -f index.jsx ]; then cp index.jsx src/routes/index.jsx; fi
+
+        RUN cat <<'EOF' > src/entry-client.jsx
+        import { mount, StartClient } from "@solidjs/start/client";
+        mount(() => <StartClient />, document.getElementById("app"));
+        EOF
+
+        RUN cat <<'EOF' > src/entry-server.jsx
+        import { createHandler, StartServer } from "@solidjs/start/server";
+        export default createHandler(() => (
+          <StartServer
+            document={({ assets, children, scripts }) => (
+              <html lang="en">
+                <head>
+                  <meta charset="utf-8" />
+                  <meta name="viewport" content="width=device-width, initial-scale=1" />
+                  <title>S4 Service Provider Console</title>
+                  {assets}
+                </head>
+                <body style="margin: 0; background-color: #111827; color: #f3f4f6; font-family: system-ui, -apple-system, sans-serif;">
+                  <div id="app">{children}</div>
+                  {scripts}
+                </body>
+              </html>
+            )}
+          />
+        ));
+        EOF
+
+        RUN cat <<'EOF' > src/app.jsx
+        import { Router } from "@solidjs/router";
+        import { FileRoutes } from "@solidjs/start/router";
+        import { Suspense } from "solid-js";
+        export default function App() {
+          return (
+            <Router root={props => <Suspense>{props.children}</Suspense>}>
+              <FileRoutes />
+            </Router>
+          );
+        }
+        EOF
+
+        RUN npm run build
+        RUN mkdir -p .output/server/chunks/public && cp -r .output/public/* .output/server/chunks/public/
+
+        EXPOSE 3000
+        CMD ["npm", "run", "start"]
+    ports:
+      - "3000:3000"
+    environment:
+      - PUBLIC_API_URL=http://app:8000
+      - S4_GATEWAY_URL=http://s4_gateway:8080
+    depends_on:
+      - s4_gateway
+      - app
+
+  serverless_functions_gateway:
+      build:
+        context: ./s4
+        dockerfile_inline: |
+          FROM dart:stable AS builder
+          WORKDIR /app
+          RUN echo "name: serverless_functions_gateway" > pubspec.yaml && \
+              echo "environment:" >> pubspec.yaml && \
+              echo "  sdk: '>=3.0.0 <4.0.0'" >> pubspec.yaml && \
+              echo "dependencies:" >> pubspec.yaml && \
+              echo "  shelf: ^1.4.1" >> pubspec.yaml && \
+              echo "  shelf_router: ^1.1.4" >> pubspec.yaml && \
+              echo "  http: ^1.2.0" >> pubspec.yaml && \
+              echo "  isolate_manager: ^5.2.0" >> pubspec.yaml
+          COPY serverless_functions_gateway.dart ./
+          RUN grep -q "void main(" serverless_functions_gateway.dart || echo "void main() async => await S4ServerlessGateway(s4GatewayUrl: Platform.environment['S4_GATEWAY_URL'] ?? 'http://s4_gateway:8080').initialize(proxyPort: 8081);" >> serverless_functions_gateway.dart
+          RUN dart pub get
+          RUN dart compile exe serverless_functions_gateway.dart -o serverless_gateway
+          RUN test -f serverless_gateway || (echo "Compilation failed!" && exit 1)
+
+          FROM alpine:3.20
+          RUN apk add --no-cache libstdc++ ca-certificates libc6-compat
+          WORKDIR /app
+          COPY --from=builder /app/serverless_gateway /app/serverless_gateway
+          EXPOSE 8081
+          CMD ["/app/serverless_gateway"]
+      ports:
+        - "8081:8081"
+      environment:
+        - S4_GATEWAY_URL=http://s4_gateway:8080
+      depends_on:
+        - s4_gateway
+
   app:
     build:
       context: .
@@ -28,6 +216,7 @@ services:
             curl \
             git \
             libpq-dev \
+            postgresql-client \
             && rm -rf /var/lib/apt/lists/*
 
         RUN pip install --no-cache-dir \
@@ -41,26 +230,129 @@ services:
             "psycopg[binary,pool]" \
             pgvector==0.2.5 \
             websockets==12.0 \
-            networkx==3.2.1
+            networkx==3.2.1 \
+            mwparserfromhell==0.7.2
+
+        RUN cat <<'EOF' > abbr_map.json
+        {
+          "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+          "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+          "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+          "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+          "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS", "missouri": "MO",
+          "montana": "MT", "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+          "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
+          "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+          "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT",
+          "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+          "district of columbia": "DC"
+        }
+        EOF
 
         RUN mkdir -p /app/data && \
             curl -L "https://raw.githubusercontent.com/cisagov/dotgov-data/main/current-full.csv" -o /app/data/current-full.csv && \
             curl -L "https://raw.githubusercontent.com/nickdenardis/edu-inventory/master/edu-info.csv" -o /app/data/edu-domains.csv && \
+            curl -L "https://raw.githubusercontent.com/esonderegger/dotmil-domains/master/dotmil-domains.csv" -o /app/data/mil-domains.csv && \
             python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
-        COPY . .
+        RUN cat <<'EOF' > db_utils.py
+        import asyncio
+        import os
+        import subprocess
+        import tempfile
+        import httpx
 
+        DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@db:5432/gov_intel")
+        S4_GATEWAY_URL = os.environ.get("S4_GATEWAY_URL", "http://s4_gateway:8080")
+        S4_BUCKET = "database-backups"
+        S4_BACKUP_KEY = "gov_intel_dump.sql"
+
+        async def upload_to_s4(bucket: str, key: str, data: bytes):
+          async with httpx.AsyncClient() as client:
+            try:
+              await client.put(f"{S4_GATEWAY_URL}/buckets/{bucket}/keys/{key}", content=data, timeout=10.0)
+            except Exception:
+              pass
+
+        async def restore_db_from_s4():
+          async with httpx.AsyncClient() as client:
+            try:
+              resp = await client.get(f"{S4_GATEWAY_URL}/buckets/{S4_BUCKET}/keys/{S4_BACKUP_KEY}", timeout=15.0)
+              if resp.status_code == 200 and len(resp.content) > 0:
+                content = resp.content
+                if content.startswith(b"S4") or b"html" in content[:50].lower():
+                  return False
+
+                dump_path = tempfile.mktemp(suffix=".sql")
+                with open(dump_path, "wb") as f:
+                  f.write(content)
+                
+                db_url_parts = DATABASE_URL.replace("postgresql://", "").split("@")
+                user_pass, host_db = db_url_parts[0], db_url_parts[1]
+                user, password = user_pass.split(":")
+                host_port, dbname = host_db.split("/")
+                host, port = host_port.split(":") if ":" in host_port else (host_port, "5432")
+
+                env = os.environ.copy()
+                env["PGPASSWORD"] = password
+                
+                cmd = ["psql", "-h", host, "-p", port, "-U", user, "-d", dbname, "-f", dump_path]
+                proc = await asyncio.to_thread(subprocess.run, cmd, env=env, capture_output=True, text=True)
+                
+                if os.path.exists(dump_path):
+                  os.unlink(dump_path)
+                return proc.returncode == 0
+            except Exception:
+              pass
+            return False
+
+        async def backup_db_to_s4():
+          try:
+            db_url_parts = DATABASE_URL.replace("postgresql://", "").split("@")
+            user_pass, host_db = db_url_parts[0], db_url_parts[1]
+            user, password = user_pass.split(":")
+            host_port, dbname = host_db.split("/")
+            host, port = host_port.split(":") if ":" in host_port else (host_port, "5432")
+
+            env = os.environ.copy()
+            env["PGPASSWORD"] = password
+            
+            dump_path = tempfile.mktemp(suffix=".sql")
+            cmd = ["pg_dump", "-h", host, "-p", port, "-U", user, "-d", dbname, "-F", "p", "-f", dump_path]
+            
+            proc = await asyncio.to_thread(subprocess.run, cmd, env=env, capture_output=True, text=True)
+            if proc.returncode == 0 and os.path.exists(dump_path):
+              with open(dump_path, "rb") as f:
+                dump_data = f.read()
+              os.unlink(dump_path)
+              
+              async with httpx.AsyncClient() as client:
+                await client.put(f"{S4_GATEWAY_URL}/buckets/{S4_BUCKET}/keys/{S4_BACKUP_KEY}", content=dump_data, timeout=30.0)
+          except Exception:
+            pass
+        EOF
+
+        COPY . .
         EXPOSE 8000
         CMD ["python", "main.py"]
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/gov_intel
+      - S4_GATEWAY_URL=http://s4_gateway:8080
+      - OLLAMA_HOST=http://ollama:11434
+      - 'STATE_TO_ABBR={"alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC"}'
     volumes:
       - ./index.html:/app/index.html
+      - ./main.py:/app/main.py
     depends_on:
       db:
+        condition: service_healthy
+      s4_gateway:
+        condition: service_started
+      ollama:
         condition: service_healthy
 
 volumes:
   pg_data:
+  ollama_data:

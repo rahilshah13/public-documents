@@ -1,14 +1,15 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>.Gov & .Edu Document Download & Search</title>
+    <title>Public Documents</title>
     <script type="importmap">
     {
         "imports": {
             "solid-js": "https://esm.sh/solid-js@1.8.14",
             "solid-js/web": "https://esm.sh/solid-js@1.8.14/web",
+            "solid-js/store": "https://esm.sh/solid-js@1.8.14/store",
             "solid-js/h": "https://esm.sh/solid-js@1.8.14/h"
         }
     }
@@ -18,189 +19,234 @@
     <script src="https://unpkg.com/topojson-client@3"></script>
     <style>
         input[type=number]::-webkit-inner-spin-button, 
-        input[type=number]::-webkit-outer-spin-button { 
-            -webkit-appearance: none; 
-            margin: 0; 
-        }
-        input[type=number] {
-            -moz-appearance: textfield;
-        }
+        input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+        input[type=number] { -moz-appearance: textfield; }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 antialiased h-screen overflow-hidden flex flex-col font-sans">
-    <div id="app" class="flex-1 flex flex-col h-full overflow-hidden"></div>
+<body class="bg-slate-50 text-slate-900 antialiased min-h-screen flex flex-col font-sans">
+    <div id="app" class="flex-1 flex flex-col w-full"></div>
     <script type="module">
-        import { createSignal, onMount } from "solid-js";
+        import { createSignal, createMemo, createResource, onMount, createEffect, Suspense } from "solid-js";
+        import { createStore } from "solid-js/store";
         import { render } from "solid-js/web";
         import h from "solid-js/h";
 
-        const stateNameToAbbr = {
-            "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
-            "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
-            "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
-            "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
-            "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO",
-            "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ",
-            "New Mexico": "NM", "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
-            "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
-            "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
-            "Virginia": "VA", "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
-            "District of Columbia": "DC"
-        };
-
         function App() {
-            const [pdfs, setPdfs] = createSignal([]);
-            const [domains, setDomains] = createSignal([]);
-            const [q, setQ] = createSignal("");
-            const [embeddingStatus, setEmbeddingStatus] = createSignal("");
-            const [res, setRes] = createSignal([]);
-            const [countyHits, setCountyHits] = createSignal({});
-            const [progress, setProgress] = createSignal({visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, counties_completed: 0, total_counties: 3144, gov_crawled: 0, edu_crawled: 0, total_gov: 0, total_edu: 0});
-            const [showModal, setShowModal] = createSignal(false);
-            const [isPaused, setIsPaused] = createSignal(false);
-            const [isEmbeddingPaused, setIsEmbeddingPaused] = createSignal(false);
-            const [isEmbeddingActive, setIsEmbeddingActive] = createSignal(false);
-            const [isSearching, setIsSearching] = createSignal(false);
-            const [urlQueueStatus, setUrlQueueStatus] = createSignal({ queue_len: 0, current: "Idle" });
-            const [embeddingQueueStatus, setEmbeddingQueueStatus] = createSignal({ queue_len: 0, current: "Idle" });
-            const [graphData, setGraphData] = createSignal({ nodes: [], edges: [], community_count: 0, partitions: [], modularity: 0.0, clustering_coefficient: 0.0 });
-            
-            const [nodeSearchQuery, setNodeSearchQuery] = createSignal("");
-            const [tldFilter, setTldFilter] = createSignal("all");
-            const [queueTldView, setQueueTldView] = createSignal("gov");
-            const [activeBackendMode, setActiveBackendMode] = createSignal("gov");
+            const [state, setState] = createStore({
+                q: "",
+                exhaustive: false,
+                isEmbActive: false,
+                progress: { visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, gov_completed: 0, wiki_crawled: 0, gov_crawled: 0, edu_crawled: 0, mil_crawled: 0, total_gov: 0, total_edu: 0, total_mil: 0, total_wiki: 6800000 },
+                isPaused: true,
+                graphData: { nodes: [], edges: [], community_count: 0, modularity: 0.0, clustering_coefficient: 0.0 },
+                graphLoading: false,
+                nodeQuery: "",
+                tldFilter: "all",
+                wikiTotal: 0,
+                wikiTotalCount: 6800000,
+                pendingEmbeddings: 0,
+                totalEmbeddings: 0,
+                pinnedNodes: [],
+                pinMode: false,
+                activeTab: 'map',
+                bottomPaneTab: 'results',
+                isGraphFullscreen: false,
+                displayLimit: 20
+            });
 
-            const [indexSize, setIndexSize] = createSignal(0);
-            const [processedDocsCount, setProcessedDocsCount] = createSignal(0);
-            const [totalDocsCount, setTotalDocsCount] = createSignal(0);
-            const [totalEmbeddingsCount, setTotalEmbeddingsCount] = createSignal(0);
-
-            const [embeddingLevel, setEmbeddingLevel] = createSignal('chunk');
+            const [logs, setLogs] = createSignal([{ time: new Date().toLocaleTimeString(), type: "SYSTEM", message: "Pipeline logging initialized." }]);
             const [hoveredNode, setHoveredNode] = createSignal(null);
             const [hoverPos, setHoverPos] = createSignal({ x: 0, y: 0 });
-            const [pinnedNodes, setPinnedNodes] = createSignal([]);
-            const [pinMode, setPinMode] = createSignal(false);
-
-            const [activeTab, setActiveTab] = createSignal('map');
             const [mapLoading, setMapLoading] = createSignal(true);
+            const [searchTrigger, setSearchTrigger] = createSignal("");
+            const [showProgressTooltip, setShowProgressTooltip] = createSignal(false);
 
-            let mapContainer;
-            let graphContainer;
-            let sampleSizeInput;
-            let targetPartitionsInput;
+            let embeddingAbortController = null;
+            let graphAbortController = null;
 
-            let cachedGovStatusMap = {};
-            let cachedEduStatusMap = {};
-            let canvasZoomTransform = d3.zoomIdentity;
-            let canvasZoomBehavior = null;
-            let currentSimulation = null;
-            let embeddingEvtSource = null;
-            let graphInitialized = false;
+            const [searchResultResource, { mutate: mutateSearchResults }] = createResource(searchTrigger, async (query) => {
+                if (!query) return [];
+                try {
+                    const resp = await fetch("/search", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ query, exhaustive: state.exhaustive })
+                    });
+                    const r = await resp.json();
+                    setState("displayLimit", 20);
+                    return (r.results || []).slice(0, 100);
+                } catch (e) {
+                    return [];
+                }
+            });
+
+            let mapContainer, graphContainer, sampleSizeInput, targetPartitionsInput, graphWrapperRef;
+            let statusMaps = { gov: {}, edu: {}, mil: {} };
+            let zoomTransform = d3.zoomIdentity, zoomBehavior = null, simulation = null;
+
+            const log = (type, message) => setLogs(l => [{ time: new Date().toLocaleTimeString(), type, message }, ...l.slice(0, 99)]);
 
             onMount(async () => {
                 try {
                     const initState = await (await fetch("/state")).json();
-                    if (initState.pdfs) setPdfs(initState.pdfs);
-                    if (initState.progress) setProgress(initState.progress);
-                    const domData = await (await fetch("/domains-status")).json();
-                    setDomains(domData);
-                } catch (e) {}
-
-                try {
-                    const statusRes = await (await fetch("/crawler/status")).json();
-                    setIsPaused(statusRes.paused);
-                    if (statusRes.mode) {
-                        setQueueTldView(statusRes.mode);
-                        setActiveBackendMode(statusRes.mode);
-                        setUrlQueueStatus(q => ({ ...q, queue_len: statusRes.pending_count }));
+                    if (initState.progress) {
+                        setState("progress", initState.progress);
+                        if (initState.progress.wiki_crawled !== undefined) {
+                            setState("wikiTotal", initState.progress.wiki_crawled);
+                            setState("progress", "wiki_crawled", initState.progress.wiki_crawled);
+                        }
+                        if (initState.progress.total_wiki !== undefined) {
+                            setState("wikiTotalCount", initState.progress.total_wiki);
+                            setState("progress", "total_wiki", initState.progress.total_wiki);
+                        }
                     }
+                    const statRes = await (await fetch("/crawler/status")).json();
+                    setState("isPaused", statRes.paused);
                 } catch (e) {}
 
-                fetchIndexStats();
+                fetchStats();
+                fetchWikiStats();
+                fetchGraphCommunities();
 
-                if (mapContainer) {
-                    initMap(mapContainer);
-                }
+                setTimeout(() => {
+                    if (mapContainer) initMap(mapContainer);
+                }, 100);
+
+                setInterval(async () => {
+                    fetchWikiStats();
+                }, 3000);
 
                 const connectWs = () => {
-                    const ws = new WebSocket("ws://" + location.host + "/ws");
+                    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss://' : 'ws://'}${location.port === '3000' ? `${location.hostname}:8000` : location.host}/ws`);
                     ws.onmessage = async e => {
-                        const d = JSON.parse(e.data);
-                        if (d.type === "progress" || d.type === "stats") {
-                            if (d.visited !== undefined) setProgress(p => ({...p, visited: d.visited, total: d.total}));
-                            if (d.stats) setProgress(p => ({...p, ...d.stats}));
-                        } else if (d.type === "pdf_found") {
-                            setPdfs(p => [d, ...p]);
-                            fetchIndexStats();
-                        } else if (d.type === "domain_update") {
-                            setDomains(ds => {
-                                const updated = ds.map(dom => dom.domain === d.domain ? {...dom, status: d.status} : dom);
-                                return updated;
-                            });
-                            if (mapContainer && activeTab() === 'map') {
-                                fetchAndUpdateMapColors();
+                        try {
+                            const d = JSON.parse(e.data);
+                            if (d.type === "progress" || d.type === "stats") {
+                                if (d.stats) {
+                                    setState("progress", p => ({ ...p, ...d.stats }));
+                                    if (d.stats.wiki_crawled !== undefined) {
+                                        setState("wikiTotal", d.stats.wiki_crawled);
+                                        setState("progress", "wiki_crawled", d.stats.wiki_crawled);
+                                    }
+                                    if (d.stats.total_wiki !== undefined) {
+                                        setState("wikiTotalCount", d.stats.total_wiki);
+                                        setState("progress", "total_wiki", d.stats.total_wiki);
+                                    }
+                                    log("PROGRESS", `Crawled: Visited=${d.stats.visited || 0}, PDFs=${d.stats.pdfs_discovered || 0}, Wiki=${d.stats.wiki_crawled || 0}`);
+                                }
+                            } else if (d.type === "pdf_found" || d.type === "document_discovered") {
+                                if (d.title) log("DISCOVERY", `Wiki Article: "${d.title}" (${d.pdf_url})`);
+                                else log("DISCOVERY", `Discovered document: ${d.pdf_url || 'Unknown URL'}`);
+                                fetchStats();
+                                fetchWikiStats();
+                            } else if (d.type === "domain_update" || d.type === "crawl_complete" || d.type === "wiki_crawl" || d.type === "wiki_article" || d.type === "wiki_progress") {
+                                if (d.domain === "en.wikipedia.org" || d.type.includes("wiki") || d.title) {
+                                    log("WIKI", `Crawled Wiki Article: ${d.title || d.url || d.domain || 'In Progress'}`);
+                                } else {
+                                    log("CRAWL", `Crawl complete for [${d.domain || 'Target'}]: ${d.status || 'SUCCESS'}`);
+                                }
+                                fetchWikiStats();
+                                if (mapContainer && state.activeTab === 'map') updateMapColors();
+                            } else if (d.type === "embedding_complete" || d.type === "vector_indexed") {
+                                log("EMBEDDING", "Vector embedding generated & stored.");
+                                fetchStats();
+                                fetchWikiStats();
+                            } else if (d.message) {
+                                log(d.type || "INFO", d.message);
                             }
-                        } else if (d.type === "embedding_complete") {
-                            setPdfs(p => p.map(doc => doc.pdf_url === d.metric.pdf_url ? {...doc, processed: 1} : doc));
-                            fetchIndexStats();
-                        } else if (d.type === "queue_update") {
-                            if (d.tld_type === activeBackendMode()) {
-                                setUrlQueueStatus({ queue_len: d.queue_len, current: d.current });
-                            }
-                        } else if (d.type === "embedding_queue_update") {
-                            setEmbeddingQueueStatus({ queue_len: d.queue_len, current: d.current });
-                        } else if (d.type === "louvain_progress") {
-                            setEmbeddingStatus(d.message);
-                        }
+                        } catch (err) {}
                     };
                     ws.onclose = () => setTimeout(connectWs, 3000);
                 };
                 connectWs();
             });
 
-            const switchQueueTld = async (mode) => {
-                setQueueTldView(mode);
+            const fetchWikiStats = async () => {
                 try {
-                    const resp = await fetch("/crawler/tld-mode", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ mode })
+                    const r = await (await fetch("/wiki/status")).json();
+                    setState("wikiTotal", r.total_downloaded || 0);
+                    setState("progress", "wiki_crawled", r.total_downloaded || 0);
+                    if (r.total_wiki !== undefined) {
+                        setState("wikiTotalCount", r.total_wiki);
+                        setState("progress", "total_wiki", r.total_wiki);
+                    }
+                } catch (e) {}
+            };
+
+            createEffect(() => {
+                const tab = state.activeTab;
+                if (tab === 'map') {
+                    setTimeout(() => {
+                        if (mapContainer && (!mapContainer.children.length || !mapContainer.querySelector("svg"))) {
+                            initMap(mapContainer);
+                        }
+                    }, 50);
+                } else if (tab === 'search') {
+                    requestAnimationFrame(() => {
+                        setTimeout(() => {
+                            if (graphContainer) {
+                                renderCanvasGraph(state.graphData);
+                            }
+                        }, 60);
                     });
-                    const data = await resp.json();
-                    setActiveBackendMode(data.mode);
-                    setUrlQueueStatus({ queue_len: data.pending_count, current: data.pending_count > 0 ? "Ready" : "Idle" });
-                } catch (e) {}
-            };
-
-            const fetchIndexStats = async () => {
-                try {
-                    const res = await (await fetch("/index-stats")).json();
-                    setIndexSize(res.index_size);
-                    setProcessedDocsCount(res.processed_documents);
-                    setTotalDocsCount(res.total_documents);
-                    setTotalEmbeddingsCount(res.total_embeddings);
-                } catch (e) {}
-            };
-
-            const getCachedTopoJson = async () => {
-                const cached = localStorage.getItem("us_topo_json_cache");
-                if (cached) {
-                    try { return JSON.parse(cached); } catch (err) {}
                 }
-                const data = await d3.json("https://cdn.jsdelivr.net/npm/us-atlas@3/counties-albers-10m.json");
-                try { localStorage.setItem("us_topo_json_cache", JSON.stringify(data)); } catch (err) {}
-                return data;
+            });
+
+            const fetchStats = async () => {
+                try {
+                    const r = await (await fetch("/index-stats")).json();
+                    setState("pendingEmbeddings", (r.total_documents || 0) - (r.processed_documents || 0));
+                    setState("totalEmbeddings", r.total_embeddings || 0);
+                } catch (e) {}
+            };
+
+            const generateEmbeddings = async () => {
+                if (state.isEmbActive) {
+                    await fetch("/embeddings/cancel", { method: "POST" });
+                    setState("isEmbActive", false);
+                    return;
+                }
+                setState("isEmbActive", true);
+                embeddingAbortController = new AbortController();
+                try {
+                    const res = await fetch("/process-embeddings-stream", { signal: embeddingAbortController.signal });
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        for (const line of decoder.decode(value, { stream: true }).split("\n")) {
+                            if (line.startsWith("data: ")) {
+                                fetchStats();
+                            }
+                        }
+                    }
+                } catch (e) {
+                } finally {
+                    setState("isEmbActive", false);
+                    fetchStats();
+                }
+            };
+
+            const cancelSearch = () => {
+                if (graphAbortController) {
+                    graphAbortController.abort();
+                    graphAbortController = null;
+                }
+                setState("graphLoading", false);
+                mutateSearchResults([]);
+                log("SEARCH", "Louvain graph & search query cancelled.");
             };
 
             const initMap = async (container) => {
+                if (!container) return;
                 setMapLoading(true);
                 container.innerHTML = "";
-                
-                const usData = await getCachedTopoJson();
-                
-                const svg = d3.select(container).append("svg")
-                    .attr("viewBox", "0 0 960 600")
-                    .attr("class", "w-full h-full max-h-[480px] object-contain");
+                const cached = localStorage.getItem("us_topo_json_cache");
+                const usData = cached ? JSON.parse(cached) : await d3.json("https://cdn.jsdelivr.net/npm/us-atlas@3/counties-albers-10m.json");
+                if (!cached) localStorage.setItem("us_topo_json_cache", JSON.stringify(usData));
+
+                const svg = d3.select(container).append("svg").attr("viewBox", "0 0 960 720").attr("class", "w-full h-full max-h-[640px] object-contain");
                 const path = d3.geoPath();
                 const counties = topojson.feature(usData, usData.objects.counties).features;
                 const states = topojson.feature(usData, usData.objects.states).features;
@@ -209,660 +255,445 @@
                 let stateStats = {};
                 try {
                     const [mapResp, statsResp] = await Promise.all([
-                        fetch("/map-status", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ counties: countyNames })
-                        }),
+                        fetch("/map-status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counties: countyNames }) }),
                         fetch("/state-stats")
                     ]);
-                    const mapResJson = await mapResp.json();
-                    cachedGovStatusMap = mapResJson.gov || {};
-                    cachedEduStatusMap = mapResJson.edu || {};
+                    const mapRes = await mapResp.json();
+                    statusMaps = { gov: mapRes.gov || {}, edu: mapRes.edu || {}, mil: mapRes.mil || {} };
                     stateStats = await statsResp.json();
                 } catch (e) {}
 
                 let tooltip = d3.select(container).select(".map-tooltip");
-                if (tooltip.empty()) {
-                    tooltip = d3.select(container).append("div")
-                        .attr("class", "map-tooltip absolute hidden bg-slate-900 text-white text-xs rounded p-3 pointer-events-none shadow-xl z-50 font-mono");
-                }
+                if (tooltip.empty()) tooltip = d3.select(container).append("div").attr("class", "map-tooltip absolute hidden bg-slate-900 text-white text-xs rounded p-3 pointer-events-none shadow-xl z-50 font-mono");
 
                 svg.append("g").selectAll("path").data(counties).join("path")
-                    .attr("d", path)
-                    .attr("stroke", "#cbd5e1")
-                    .attr("stroke-width", 0.2)
-                    .attr("class", "county-path")
+                    .attr("d", path).attr("stroke", "#cbd5e1").attr("stroke-width", 0.2).attr("class", "county-path")
                     .attr("data-county", d => d.properties.name || "")
-                    .attr("fill", d => {
-                        const countyName = d.properties.name || "";
-                        const govStatus = cachedGovStatusMap[countyName] || "PENDING";
-                        return govStatus === 'COMPLETED' ? "#10b981" : (govStatus === 'CRAWLING' || govStatus === 'QUEUED' ? "#f59e0b" : "#e2e8f0");
-                    })
+                    .attr("fill", d => statusMaps.gov[d.properties.name] === 'COMPLETED' ? "#10b981" : (['CRAWLING', 'QUEUED'].includes(statusMaps.gov[d.properties.name]) ? "#f59e0b" : "#e2e8f0"))
                     .on("mousemove", (event, d) => {
-                        const countyName = d.properties.name || "Unknown County";
-                        const govStatus = cachedGovStatusMap[countyName] || "PENDING";
-                        const eduStatus = cachedEduStatusMap[countyName] || "PENDING";
-                        tooltip.classed("hidden", false)
-                            .html(`<strong>County: ${countyName}</strong><br/>.gov Status: ${govStatus}<br/>.edu Status: ${eduStatus}`);
+                        const name = d.properties.name || "Unknown";
+                        tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>.gov: ${statusMaps.gov[name] || 'PENDING'}<br/>.edu: ${statusMaps.edu[name] || 'PENDING'}<br/>.mil: ${statusMaps.mil[name] || 'PENDING'}`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
-                    .on("mouseleave", () => {
-                        tooltip.classed("hidden", true);
-                    });
+                    .on("mouseleave", () => tooltip.classed("hidden", true));
 
                 svg.append("g").selectAll("path").data(states).join("path")
-                    .attr("d", path)
-                    .attr("fill", "transparent")
-                    .attr("stroke", "#475569")
-                    .attr("stroke-width", 0.6)
-                    .attr("class", "state-overlay-path")
+                    .attr("d", path).attr("fill", "transparent").attr("stroke", "#475569").attr("stroke-width", 0.6)
                     .on("mousemove", (event, d) => {
-                        const stateName = d.properties.name;
-                        const abbr = stateNameToAbbr[stateName] || "";
-                        const stats = stateStats[abbr] || { gov_urls: 0, edu_urls: 0, edu_domains: 0, urls: 0, documents: 0, embeddings: 0 };
-                        
-                        tooltip.classed("hidden", false)
-                            .html(`<strong>${stateName} (${abbr || 'N/A'})</strong><br/>.gov Domains: ${stats.gov_urls || 0}<br/>.edu Domains: ${stats.edu_urls ?? stats.edu_domains ?? 0}<br/>Documents: ${stats.documents || 0}<br/>Embeddings: ${stats.embeddings || 0}`);
+                        const name = d.properties.name, stats = stateStats[name] || stateStats[name?.toUpperCase()] || stateStats[name?.toLowerCase()] || { gov_urls: 0, edu_urls: 0, mil_urls: 0, documents: 0, embeddings: 0 };
+                        tooltip.classed("hidden", false).html(`<strong>${name}</strong><br/>.gov: ${stats.gov_urls || stats.gov || 0} | .edu: ${stats.edu_urls || stats.edu || 0} | .mil: ${stats.mil_urls || stats.mil || 0}<br/>Docs: ${stats.documents || 0} | Embeddings: ${stats.embeddings || 0}`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
-                    .on("mouseleave", () => {
-                        tooltip.classed("hidden", true);
-                    });
+                    .on("mouseleave", () => tooltip.classed("hidden", true));
 
                 setMapLoading(false);
             };
 
-            const fetchAndUpdateMapColors = async () => {
+            const updateMapColors = async () => {
                 if (!mapContainer) return;
                 const paths = mapContainer.querySelectorAll(".county-path");
-                if (paths.length === 0) return;
-
-                const countyNames = Array.from(paths).map(p => p.getAttribute("data-county")).filter(Boolean);
+                if (!paths.length) return;
                 try {
-                    const resp = await fetch("/map-status", {
+                    const resp = await fetch("/map-status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counties: Array.from(paths).map(p => p.getAttribute("data-county")).filter(Boolean) }) });
+                    const mapRes = await resp.json();
+                    statusMaps = { gov: mapRes.gov || {}, edu: mapRes.edu || {}, mil: mapRes.mil || {} };
+                    paths.forEach(p => {
+                        const status = statusMaps.gov[p.getAttribute("data-county")] || "PENDING";
+                        p.setAttribute("fill", status === 'COMPLETED' ? "#10b981" : (['CRAWLING', 'QUEUED'].includes(status) ? "#f59e0b" : "#e2e8f0"));
+                    });
+                } catch (e) {}
+            };
+
+            const handleSearchSubmit = async (e) => {
+                e.preventDefault();
+                const queryVal = state.q.trim();
+                if (!queryVal) return;
+                setState("nodeQuery", queryVal);
+                setSearchTrigger(queryVal);
+                
+                try {
+                    const resp = await fetch("/search", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ counties: countyNames })
+                        body: JSON.stringify({ query: queryVal, exhaustive: state.exhaustive })
                     });
-                    const mapResJson = await resp.json();
-                    cachedGovStatusMap = mapResJson.gov || {};
-                    cachedEduStatusMap = mapResJson.edu || {};
-                    
-                    paths.forEach(pathEl => {
-                        const name = pathEl.getAttribute("data-county");
-                        const status = cachedGovStatusMap[name] || "PENDING";
-                        const fillColor = status === 'COMPLETED' ? "#10b981" : (status === 'CRAWLING' || status === 'QUEUED' ? "#f59e0b" : "#e2e8f0");
-                        pathEl.setAttribute("fill", fillColor);
-                    });
-                } catch (e) {}
-            };
+                    const r = await resp.json();
+                    setState("displayLimit", 20);
+                    mutateSearchResults([...(r.results || []).slice(0, 100)]);
+                } catch (err) {}
 
-            const toggleCrawler = async () => {
-                try {
-                    const res = await (await fetch("/crawler/toggle", { method: "POST" })).json();
-                    setIsPaused(res.paused);
-                } catch (e) {}
-            };
-
-            const toggleEmbedding = () => {
-                if (!isEmbeddingActive()) {
-                    setIsEmbeddingActive(true);
-                    setIsEmbeddingPaused(false);
-                    triggerEmbeddingStream();
-                } else {
-                    const nextPaused = !isEmbeddingPaused();
-                    setIsEmbeddingPaused(nextPaused);
-                    if (nextPaused) {
-                        if (embeddingEvtSource) {
-                            embeddingEvtSource.close();
-                            embeddingEvtSource = null;
-                        }
-                        setEmbeddingStatus("Embedding paused.");
-                        setEmbeddingQueueStatus(q => ({ ...q, current: "Paused" }));
-                    } else {
-                        triggerEmbeddingStream();
-                    }
-                }
-            };
-
-            const search = async e => {
-                if (e) e.preventDefault();
-                if (!q().trim()) return;
-                setIsSearching(true);
-                try {
-                    const r = await (await fetch("/search", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({query: q()}) })).json();
-                    setRes(r.results || []);
-                    setCountyHits(r.county_hits || {});
-                } catch (err) {
-                    setRes([]);
-                } finally {
-                    setIsSearching(false);
-                }
-            };
-
-            const triggerEmbeddingStream = async () => {
-                setEmbeddingStatus("Starting extraction pipeline (.gov & .edu)...");
-                if (embeddingEvtSource) {
-                    embeddingEvtSource.close();
-                }
-                embeddingEvtSource = new EventSource("/process-embeddings-stream");
-                embeddingEvtSource.onmessage = async event => {
-                    if (isEmbeddingPaused()) return;
-                    const data = JSON.parse(event.data);
-                    if (data.status === 'progress') setEmbeddingStatus(data.message);
-                    else if (data.status === 'completed') { 
-                        setEmbeddingStatus(data.message); 
-                        embeddingEvtSource.close();
-                        embeddingEvtSource = null;
-                        setIsEmbeddingActive(false);
-                        setIsEmbeddingPaused(false);
-                        fetchGraphCommunities();
-                        fetchIndexStats();
-                    }
-                    else if (data.status === 'error') setEmbeddingStatus(`Error: ${data.message}`);
-                };
-                embeddingEvtSource.onerror = () => { 
-                    if (!isEmbeddingPaused()) {
-                        setEmbeddingStatus("Stream completed."); 
-                        if (embeddingEvtSource) embeddingEvtSource.close();
-                        embeddingEvtSource = null;
-                        setIsEmbeddingActive(false);
-                        setIsEmbeddingPaused(false);
-                    }
-                    fetchIndexStats(); 
-                };
+                fetchGraphCommunities();
             };
 
             const fetchGraphCommunities = async () => {
+                if (graphAbortController) {
+                    graphAbortController.abort();
+                }
+                graphAbortController = new AbortController();
+                setState("graphLoading", true);
                 try {
-                    setEmbeddingStatus("Computing Louvain partitions (.gov & .edu)...");
-                    const sVal = sampleSizeInput ? (parseInt(sampleSizeInput.value) || 150) : 150;
-                    const pVal = targetPartitionsInput ? (parseInt(targetPartitionsInput.value) || 5) : 5;
-                    const res = await fetch(`/graph-communities?target_partitions=${pVal}&sample_size=${sVal}&level=${embeddingLevel()}`);
+                    const queryParam = encodeURIComponent(state.q);
+                    const res = await fetch(`/graph-communities?target_partitions=${targetPartitionsInput?.value || 5}&sample_size=${sampleSizeInput?.value || 150}&query=${queryParam}`, { signal: graphAbortController.signal });
                     const gRes = await res.json();
-                    setGraphData(gRes);
-                    graphInitialized = true;
-                    if (activeTab() === 'louvain') {
-                        renderCanvasGraph(gRes);
+                    setState("graphData", gRes);
+                    if (state.activeTab === 'search') {
+                        requestAnimationFrame(() => renderCanvasGraph(gRes));
                     }
-                    setEmbeddingStatus(`Clusters rendered. Modularity: ${gRes.modularity}, Clustering Coefficient: ${gRes.clustering_coefficient}`);
-                    fetchIndexStats();
-                } catch (err) {
-                    setEmbeddingStatus("Clustering failed.");
+                    fetchStats();
+                } catch (e) {
+                    if (e.name !== 'AbortError') {
+                        log("SEARCH", "Error fetching Louvain graph partitions.");
+                    }
+                } finally {
+                    setState("graphLoading", false);
                 }
             };
+
+            const filteredGraphNodes = createMemo(() => {
+                const filter = state.tldFilter;
+                const nodes = state.graphData.nodes || [];
+                return nodes.filter(d => {
+                    const txt = d.full_text, url = d.pdf_url || "";
+                    if (filter === 'edu') return txt.includes('.edu') || url.includes('.edu');
+                    if (filter === 'mil') return txt.includes('.mil') || url.includes('.mil');
+                    if (filter === 'wiki') return txt.includes('wikipedia') || url.includes('wikipedia');
+                    if (filter === 'gov') return !txt.includes('.edu') && !txt.includes('.mil') && !txt.includes('wikipedia') && (!url || (!url.includes('.edu') && !url.includes('.mil') && !url.includes('wikipedia')));
+                    return true;
+                });
+            });
 
             const renderCanvasGraph = (data) => {
                 if (!graphContainer) return;
                 graphContainer.innerHTML = "";
-                if (!data.nodes || data.nodes.length === 0) {
-                    graphContainer.innerHTML = "<div class='text-xs text-slate-400 py-12'>No indexed chunks available for graph visualization. Process pending .gov / .edu PDFs to generate embeddings.</div>";
+                const nodes = filteredGraphNodes();
+                if (!nodes.length) {
+                    graphContainer.innerHTML = "<div class='text-xs text-slate-400 py-12'>No indexed chunks available for graph visualization.</div>";
                     return;
                 }
 
-                const width = 800;
-                const height = 300;
-
+                const width = graphContainer.clientWidth || 1000;
+                const height = state.isGraphFullscreen ? 700 : 540;
                 const canvas = document.createElement("canvas");
                 canvas.width = width * window.devicePixelRatio;
                 canvas.height = height * window.devicePixelRatio;
-                canvas.style.width = "100%";
-                canvas.style.height = "auto";
-                canvas.style.maxHeight = "300px";
-                canvas.style.objectFit = "contain";
+                canvas.style.cssText = state.isGraphFullscreen ? "width:100%;height:100%;object-fit:contain;" : "width:100%;height:auto;min-height:540px;max-height:540px;object-fit:contain;";
                 graphContainer.appendChild(canvas);
 
                 const ctx = canvas.getContext("2d");
                 ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-
                 const colorScale = d3.scaleOrdinal(d3.schemeTableau10);
                 
-                const filter = tldFilter();
-                const simNodes = data.nodes.filter(d => {
-                    if (filter === 'edu') return d.full_text.includes('.edu') || (d.pdf_url && d.pdf_url.includes('.edu'));
-                    if (filter === 'gov') return !d.full_text.includes('.edu') && (!d.pdf_url || !d.pdf_url.includes('.edu'));
-                    return true;
-                }).map(d => ({...d}));
+                const simNodes = nodes.map(d => ({...d}));
+                const activeIds = new Set(simNodes.map(n => n.id));
+                const simLinks = (data.edges || []).filter(l => activeIds.has(l.source.id || l.source) && activeIds.has(l.target.id || l.target)).map(d => ({...d}));
 
-                const activeNodeIds = new Set(simNodes.map(n => n.id));
-                const simLinks = data.edges.filter(l => activeNodeIds.has(l.source.id || l.source) && activeNodeIds.has(l.target.id || l.target)).map(d => ({...d}));
-
-                if (currentSimulation) currentSimulation.stop();
-
-                currentSimulation = d3.forceSimulation(simNodes)
-                    .force("link", d3.forceLink(simLinks).id(d => d.id).distance(35))
-                    .force("charge", d3.forceManyBody().strength(-20))
+                if (simulation) simulation.stop();
+                simulation = d3.forceSimulation(simNodes)
+                    .force("link", d3.forceLink(simLinks).id(d => d.id).distance(45))
+                    .force("charge", d3.forceManyBody().strength(-25))
                     .force("center", d3.forceCenter(width / 2, height / 2));
 
                 const draw = () => {
                     ctx.save();
                     ctx.clearRect(0, 0, width, height);
-                    ctx.translate(canvasZoomTransform.x, canvasZoomTransform.y);
-                    ctx.scale(canvasZoomTransform.k, canvasZoomTransform.k);
+                    ctx.translate(zoomTransform.x, zoomTransform.y);
+                    ctx.scale(zoomTransform.k, zoomTransform.k);
 
-                    ctx.strokeStyle = "#cbd5e1";
-                    ctx.lineWidth = 0.8;
-                    for (const link of simLinks) {
-                        ctx.beginPath();
-                        ctx.moveTo(link.source.x, link.source.y);
-                        ctx.lineTo(link.target.x, link.target.y);
-                        ctx.stroke();
+                    ctx.strokeStyle = "#cbd5e1"; ctx.lineWidth = 0.8;
+                    for (const l of simLinks) {
+                        ctx.beginPath(); ctx.moveTo(l.source.x, l.source.y); ctx.lineTo(l.target.x, l.target.y); ctx.stroke();
                     }
 
-                    const query = nodeSearchQuery().toLowerCase().trim();
+                    const query = state.nodeQuery.toLowerCase().trim();
+                    const topResult = searchResultResource()?.[0];
 
-                    for (const node of simNodes) {
+                    for (const n of simNodes) {
                         ctx.beginPath();
-                        const isMatch = query && (node.full_text.toLowerCase().includes(query) || String(node.id).includes(query) || String(node.group).includes(query));
-                        const radius = isMatch ? 11 : 6;
-                        ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
-                        ctx.fillStyle = colorScale(node.group);
+                        const isMatch = query && (n.full_text.toLowerCase().includes(query) || String(n.id).includes(query));
+                        const isTopMatch = topResult && (n.full_text.includes(topResult.chunk.slice(0, 30)) || n.pdf_url === topResult.pdf_url);
+                        const isPinned = state.pinnedNodes.some(p => p.id === n.id);
+
+                        ctx.arc(n.x, n.y, isTopMatch ? 14 : (isPinned ? 10 : (isMatch ? 12 : 7)), 0, 2 * Math.PI);
+                        
+                        let baseColor = d3.color(colorScale(n.group));
+                        let rel = n.relevance !== undefined ? n.relevance : 0.5;
+                        if (baseColor) {
+                            baseColor.opacity = 0.3 + (rel * 0.7);
+                            ctx.fillStyle = baseColor.toString();
+                        } else {
+                            ctx.fillStyle = colorScale(n.group);
+                        }
                         ctx.fill();
 
-                        const isPinned = pinnedNodes().some(p => p.id === node.id);
-                        ctx.strokeStyle = isMatch ? "#ff00ff" : (isPinned ? "#0f172a" : "#fff");
-                        ctx.lineWidth = isMatch ? 3.5 : (isPinned ? 2 : 1.2);
+                        ctx.strokeStyle = isTopMatch ? "#eab308" : (isMatch ? "#d946ef" : (isPinned ? "#0f172a" : (rel > 0.7 ? "#0f172a" : "#ffffff")));
+                        ctx.lineWidth = isTopMatch ? 5 : (isMatch ? 4 : (isPinned ? 3 : (rel > 0.7 ? 2 : 1.2)));
                         ctx.stroke();
+
+                        if (isTopMatch) {
+                            ctx.fillStyle = "#eab308";
+                            ctx.font = "bold 12px monospace";
+                            ctx.fillText("★ TOP MATCH", n.x + 16, n.y + 4);
+                        }
                     }
                     ctx.restore();
                 };
 
-                currentSimulation.on("tick", draw);
+                simulation.on("tick", draw);
 
-                canvas.addEventListener("mousemove", (event) => {
+                canvas.addEventListener("mousemove", (e) => {
                     const rect = canvas.getBoundingClientRect();
-                    const scaleX = width / rect.width;
-                    const scaleY = height / rect.height;
-                    const mouseX = (event.clientX - rect.left) * scaleX;
-                    const mouseY = (event.clientY - rect.top) * scaleY;
-
-                    setHoverPos({ x: event.offsetX, y: event.offsetY });
-
-                    const transformedX = (mouseX - canvasZoomTransform.x) / canvasZoomTransform.k;
-                    const transformedY = (mouseY - canvasZoomTransform.y) / canvasZoomTransform.k;
-
-                    let found = null;
-                    let minDist = Infinity;
-                    for (const node of simNodes) {
-                        const dx = node.x - transformedX;
-                        const dy = node.y - transformedY;
-                        const dist = dx * dx + dy * dy;
-                        if (dist < 900 && dist < minDist) {
-                            minDist = dist;
-                            found = node;
-                        }
+                    setHoverPos({ x: e.offsetX, y: e.offsetY });
+                    const tx = ((e.clientX - rect.left) * (width / rect.width) - zoomTransform.x) / zoomTransform.k;
+                    const ty = ((e.clientY - rect.top) * (height / rect.height) - zoomTransform.y) / zoomTransform.k;
+                    let found = null, minDist = Infinity;
+                    for (const n of simNodes) {
+                        const dist = (n.x - tx) ** 2 + (n.y - ty) ** 2;
+                        if (dist < 900 && dist < minDist) { minDist = dist; found = n; }
                     }
                     setHoveredNode(found);
                 });
 
                 canvas.addEventListener("mouseleave", () => setHoveredNode(null));
-
-                canvas.addEventListener("click", (event) => {
-                    if (hoveredNode()) {
-                        const node = hoveredNode();
-                        if (pinMode()) {
-                            const currentPinned = pinnedNodes();
-                            if (!currentPinned.some(p => p.id === node.id)) {
-                                setPinnedNodes([...currentPinned, node]);
-                            }
+                canvas.addEventListener("click", () => {
+                    const node = hoveredNode();
+                    if (node && state.pinMode) {
+                        const exists = state.pinnedNodes.some(p => p.id === node.id);
+                        if (exists) {
+                            setState("pinnedNodes", state.pinnedNodes.filter(p => p.id !== node.id));
+                        } else {
+                            setState("pinnedNodes", [...state.pinnedNodes, node]);
                         }
                     }
                 });
 
-                canvasZoomBehavior = d3.zoom()
-                    .scaleExtent([0.2, 5])
-                    .on("zoom", (event) => {
-                        canvasZoomTransform = event.transform;
-                        draw();
-                    });
-
-                d3.select(canvas).call(canvasZoomBehavior);
-            };
-
-            const graphZoomIn = () => {
-                if (canvasZoomBehavior && graphContainer) {
-                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
-                    canvasSel.transition().call(canvasZoomBehavior.scaleBy, 1.3);
-                }
-            };
-
-            const graphZoomOut = () => {
-                if (canvasZoomBehavior && graphContainer) {
-                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
-                    canvasSel.transition().call(canvasZoomBehavior.scaleBy, 0.7);
-                }
-            };
-
-            const graphZoomReset = () => {
-                if (canvasZoomBehavior && graphContainer) {
-                    const canvasSel = d3.select(graphContainer.querySelector("canvas"));
-                    canvasSel.transition().call(canvasZoomBehavior.transform, d3.zoomIdentity);
-                }
+                zoomBehavior = d3.zoom().scaleExtent([0.2, 5]).on("zoom", e => { zoomTransform = e.transform; draw(); });
+                d3.select(canvas).call(zoomBehavior);
             };
 
             const switchTab = (tab) => {
-                setActiveTab(tab);
-                if (tab === 'map') {
-                    if (mapContainer && mapContainer.children.length === 0) {
-                        initMap(mapContainer);
-                    } else if (mapContainer) {
-                        fetchAndUpdateMapColors();
-                    }
-                } else if (tab === 'louvain') {
-                    if (!graphInitialized) {
-                        fetchGraphCommunities().then(() => {
-                            renderCanvasGraph(graphData());
-                        });
-                    } else {
-                        renderCanvasGraph(graphData());
-                    }
+                setState("activeTab", tab);
+                if (tab === 'search') {
+                    requestAnimationFrame(() => {
+                        setTimeout(() => {
+                            if (graphContainer) {
+                                renderCanvasGraph(state.graphData);
+                            }
+                        }, 60);
+                    });
                 }
             };
 
-            return h("div", {class: "max-w-6xl w-full h-full mx-auto p-4 md:p-6 space-y-4 flex-1 flex flex-col overflow-hidden"},
-                h("header", {class: "flex flex-col md:flex-row md:items-start justify-between gap-4 border-b border-slate-200 pb-3 shrink-0"},
-                    h("div", {},
-                        h("h1", {class: "text-xl font-semibold tracking-tight text-slate-900"}, ".Gov & .Edu Document Download & Search"),
-                    ),
-                    h("div", {class: "flex flex-col items-end gap-2"},
-                        h("div", {class: "flex items-center gap-2"},
-                            h("div", {class: "relative cursor-pointer", onMouseEnter: () => setShowModal(true), onMouseLeave: () => setShowModal(false)},
-                                h("span", {class: "text-xs text-slate-600 bg-slate-200/60 px-2.5 py-1 rounded-md font-mono inline-block"}, 
-                                    () => `Counties Scraped: ${progress().counties_completed || 0} / 3,144`
-                                ),
-                                () => showModal() && h("div", {class: "absolute right-0 top-full mt-2 w-72 bg-white border border-slate-200 rounded-xl shadow-xl p-5 text-xs space-y-2 z-50 text-slate-700"},
-                                    h("p", {class: "font-semibold border-b border-slate-100 pb-1.5 text-slate-900"}, "Telemetry & TLD Stats"),
-                                    // FIXED: Using progress().counties_completed with fallback to domains_crawled only if not present, but correctly labeled and bound
-                                    h("div", {class: "flex justify-between"}, h("span", {}, "Counties Scraped:"), h("span", {class: "font-mono font-medium"}, () => `${progress().counties_completed || 0} / 3,144`)),
-                                    h("div", {class: "flex justify-between"}, h("span", {}, ".Gov Domains Crawled:"), h("span", {class: "font-mono font-medium"}, () => progress().gov_crawled || 0)),
-                                    h("div", {class: "flex justify-between"}, h("span", {}, ".Edu Domains Crawled:"), h("span", {class: "font-mono font-medium"}, () => progress().edu_crawled || 0)),
-                                    h("div", {class: "flex justify-between"}, h("span", {}, "Total URLs Visited:"), h("span", {class: "font-mono font-medium"}, () => progress().visited)),
-                                    h("div", {class: "flex justify-between"}, h("span", {}, "Embeddings Generated:"), h("span", {class: "font-mono font-medium"}, () => totalEmbeddingsCount())),
-                                    h("div", {class: "flex justify-between"}, h("span", {}, "PDFs Discovered:"), h("span", {class: "font-mono font-medium"}, () => progress().pdfs_discovered))
-                                )
-                            )
+            return h("div", {class: "max-w-7xl w-full mx-auto p-3 md:p-5 space-y-3 flex flex-col"},
+                h("header", {class: "flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-200 pb-2.5 shrink-0 relative z-50"},
+                    h("div", {class: "flex items-center gap-4 flex-wrap"},
+                        h("div", {class: "relative inline-block"},
+                            h("h1", {
+                                onMouseEnter: () => setShowProgressTooltip(true),
+                                onMouseLeave: () => setShowProgressTooltip(false),
+                                class: "text-xl font-semibold tracking-tight text-slate-900 cursor-pointer underline decoration-dotted decoration-slate-400"
+                            }, "Public Documents"),
+                            () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-2 w-72 bg-slate-900 text-white p-3 rounded-lg shadow-2xl z-[9999] font-mono text-xs space-y-1.5 border border-slate-700"}, [
+                                h("div", {class: "text-emerald-400 font-bold border-b border-slate-700 pb-1 mb-1"}, "Pipeline Progress Overview"),
+                                h("div", {class: "flex justify-between"}, [h("span", {}, ".gov Crawled:"), h("span", {}, `${state.progress.gov_crawled || 0} / ${state.progress.total_gov || 0}`)]),
+                                h("div", {class: "flex justify-between"}, [h("span", {}, ".edu Crawled:"), h("span", {}, `${state.progress.edu_crawled || 0} / ${state.progress.total_edu || 0}`)]),
+                                h("div", {class: "flex justify-between"}, [h("span", {}, ".mil Crawled:"), h("span", {}, `${state.progress.mil_crawled || 0} / ${state.progress.total_mil || 0}`)]),
+                                h("div", {class: "flex justify-between"}, [h("span", {}, "Wiki Articles:"), h("span", {}, `${state.progress.wiki_crawled || state.wikiTotal || 0} / ${state.progress.total_wiki || state.wikiTotalCount || 6800000}`)]),
+                                h("div", {class: "border-t border-slate-700 pt-1 mt-1 flex justify-between text-slate-300"}, [h("span", {}, "PDFs Discovered:"), h("span", {}, `${state.progress.pdfs_discovered || 0}`)]),
+                                h("div", {class: "flex justify-between text-slate-300"}, [h("span", {}, "Total Visited:"), h("span", {}, `${state.progress.visited || 0}`)])
+                            ])
                         ),
-                        h("div", {class: "flex flex-col gap-1.5 text-xs font-mono items-end"},
-                            h("div", {class: "bg-slate-100 px-3 py-1 rounded border border-slate-200 flex items-center justify-between gap-4"},
-                                h("div", {class: "flex items-center gap-2 truncate"},
-                                    h("div", {class: "flex items-center gap-1 shrink-0"},
-                                        h("button", {
-                                            onClick: () => switchQueueTld('gov'),
-                                            class: () => `px-1.5 py-0.5 rounded text-[10px] font-bold uppercase transition ${queueTldView() === 'gov' ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-600'}`
-                                        }, ".gov"),
-                                        h("button", {
-                                            onClick: () => switchQueueTld('edu'),
-                                            class: () => `px-1.5 py-0.5 rounded text-[10px] font-bold uppercase transition ${queueTldView() === 'edu' ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-600'}`
-                                        }, ".edu")
-                                    ),
-                                    h("span", {class: "text-slate-500 truncate max-w-[150px]"}, () => {
-                                        return queueTldView() === activeBackendMode() ? urlQueueStatus().current : "Inactive";
-                                    })
+                        h("div", {class: "flex items-center gap-2 font-mono text-xs"},
+                            h("div", {class: "relative group flex items-center"},
+                                h("button", {
+                                    onClick: async () => { const r = await (await fetch("/crawler/toggle", {method: "POST"})).json(); setState("isPaused", r.paused); },
+                                    class: () => `p-2 rounded-lg text-white font-bold transition flex items-center justify-center shadow-xs ${state.isPaused ? 'bg-red-600 hover:bg-emerald-600' : 'bg-emerald-600 hover:bg-emerald-700'}`
+                                }, () => state.isPaused ? 
+                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z"})) : 
+                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M8 5v14l11-7z"}))
                                 ),
-                                h("div", {class: "flex items-center gap-3 shrink-0"},
-                                    h("span", {class: "text-slate-700 font-bold"}, () => {
-                                        const qView = queueTldView();
-                                        if (qView === 'edu') {
-                                            return `${Math.max(0, (progress().total_edu || 0) - (progress().edu_crawled || 0))} left`;
-                                        }
-                                        return `${Math.max(0, (progress().total_gov || 0) - (progress().gov_crawled || 0))} left`;
-                                    }),
-                                    h("button", {
-                                        onClick: toggleCrawler,
-                                        classList: {
-                                            "px-2 py-0.5 rounded text-[11px] font-semibold transition": true,
-                                            "bg-amber-200 text-amber-900": isPaused(),
-                                            "bg-emerald-200 text-emerald-900": !isPaused()
-                                        }
-                                    }, () => isPaused() ? "Resume" : "Pause")
-                                )
+                                h("span", {class: "absolute left-1/2 -translate-x-1/2 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, () => state.isPaused ? "Click to Resume Crawler" : "Click to Pause Crawler")
                             ),
-                            h("div", {class: "bg-slate-100 px-3 py-1 rounded border border-slate-200 flex items-center justify-between gap-4"},
-                                h("div", {class: "flex items-center gap-2 truncate"},
-                                    h("span", {class: "font-semibold text-slate-700 shrink-0"}, "Embedder:"),
-                                    h("span", {class: "text-slate-500 truncate max-w-[180px]"}, () => embeddingQueueStatus().current)
+                            h("div", {class: "relative group flex items-center"},
+                                h("button", {
+                                    onClick: generateEmbeddings,
+                                    class: () => `p-2 rounded-lg text-white font-bold transition flex items-center justify-center shadow-xs ${state.isEmbActive ? 'bg-amber-600 hover:bg-red-600' : 'bg-red-600 hover:bg-emerald-600'}`
+                                }, () => state.isEmbActive ?
+                                    h("svg", {class: "w-4 h-4 fill-current animate-pulse", viewBox: "0 0 24 24"}, h("path", {d: "M8 5v14l11-7z"})) :
+                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z"}))
                                 ),
-                                h("div", {class: "flex items-center gap-3 shrink-0"},
-                                    h("span", {class: "text-slate-700 font-bold"}, () => `${processedDocsCount()} / ${totalDocsCount()}`),
-                                    h("button", {
-                                        onClick: toggleEmbedding,
-                                        classList: {
-                                            "px-2 py-0.5 rounded text-[11px] font-semibold transition": true,
-                                            "bg-amber-200 text-amber-900": isEmbeddingActive() && isEmbeddingPaused(),
-                                            "bg-emerald-200 text-emerald-900": isEmbeddingActive() && !isEmbeddingPaused(),
-                                            "bg-slate-900 hover:bg-slate-800 text-white": !isEmbeddingActive()
-                                        }
-                                    }, () => {
-                                        if (!isEmbeddingActive()) return "Process";
-                                        return isEmbeddingPaused() ? "Resume" : "Pause";
-                                    })
-                                )
+                                h("span", {class: "absolute left-1/2 -translate-x-1/2 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, () => state.isEmbActive ? "Click to Cancel Embeddings" : "Click to Start Embeddings Generator")
                             )
+                        )
+                    ),
+                    h("div", {class: "flex items-center gap-3"},
+                        h("div", {class: "relative group flex items-center"},
+                            h("a", {
+                                href: "http://localhost:3000",
+                                target: "_blank",
+                                rel: "noopener noreferrer",
+                                class: "p-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg transition flex items-center justify-center shadow-xs"
+                            },
+                                h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"}))
+                            ),
+                            h("span", {class: "absolute right-0 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, "Open S4 Tenant UI")
                         )
                     )
                 ),
-                h("main", {class: "space-y-4 flex-1 flex flex-col overflow-hidden pb-4"},
-                    h("div", {class: "bg-white p-4 rounded-lg border border-slate-200/80 shadow-xs space-y-3 flex-1 flex flex-col overflow-hidden"},
-                        h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-2.5 shrink-0"},
-                            h("div", {class: "flex items-center gap-2"},
-                                h("button", {
-                                    onClick: () => switchTab('map'),
-                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'map' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
-                                }, "US Map"),
-                                h("button", {
-                                    onClick: () => switchTab('louvain'),
-                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'louvain' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
-                                }, "Louvain Partition"),
-                                h("button", {
-                                    onClick: () => switchTab('search'),
-                                    class: () => `px-3 py-1.5 rounded-md text-xs font-semibold transition ${activeTab() === 'search' ? 'bg-slate-900 text-white shadow-xs' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`
-                                }, "Document Search (.gov/.edu)")
-                            ),
-                            h("div", {class: "flex items-center gap-4 text-xs text-slate-500 font-medium"},
-                                () => activeTab() === 'map' ? h("div", {class: "flex items-center gap-3"},
-                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-emerald-500"}), "Identified"),
-                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-amber-500"}), "Crawling"),
-                                    h("div", {class: "flex items-center gap-1.5"}, h("span", {class: "w-2.5 h-2.5 rounded-full bg-slate-200"}), "Pending")
-                                ) : activeTab() === 'search' ? h("span", {class: "font-mono text-slate-400"}, () => `Index: ${totalEmbeddingsCount()} vectors`) : null
-                            )
+                h("main", {class: "space-y-3 flex flex-col w-full pb-12"},
+                    h("div", {class: "bg-white p-3 md:p-4 rounded-lg border border-slate-200/80 shadow-xs space-y-2.5 flex flex-col w-full"},
+                        h("div", {class: "flex items-center gap-1 border-b border-slate-200 pb-1.5 shrink-0 z-30 relative"},
+                            h("button", {
+                                onClick: () => switchTab('map'),
+                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'map' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, "US Map"),
+                            h("button", {
+                                onClick: () => switchTab('search'),
+                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer flex items-center gap-1.5 ${state.activeTab === 'search' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, [
+                                "Search",
+                                h("span", {class: () => `px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${state.activeTab === 'search' ? 'bg-emerald-700 text-white' : 'bg-slate-200 text-slate-700'}`}, () => state.totalEmbeddings)
+                            ])
                         ),
-                        h("div", {class: () => activeTab() === 'map' ? "flex-1 flex flex-col overflow-hidden relative" : "hidden"},
-                            h("div", {class: "w-full flex-1 bg-slate-50 rounded border border-slate-200/60 p-2 flex items-center justify-center overflow-hidden relative min-h-[480px]"},
-                                () => mapLoading() && h("div", {class: "absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 z-20 space-y-2"},
-                                    h("svg", {class: "animate-spin h-6 w-6 text-slate-500", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24"},
-                                        h("circle", {class: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", "stroke-width": "4"}),
-                                        h("path", {class: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"})
-                                    ),
-                                    h("span", {class: "text-xs font-medium text-slate-500"}, "Loading...")
-                                ),
+
+                        /* US Map Tab Panel */
+                        h("div", {style: () => state.activeTab === 'map' ? "display: flex; flex-direction: column; gap: 10px;" : "display: none;"}, [
+                            h("div", {class: "w-full bg-slate-50 rounded border border-slate-200/60 p-1 flex items-center justify-center relative min-h-[540px] max-h-[540px]"}, [
+                                () => mapLoading() && h("div", {class: "absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 z-30 space-y-2"}, [
+                                    h("div", {class: "w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
+                                    h("span", {class: "text-xs font-medium text-slate-500"}, "Loading Map...")
+                                ]),
                                 h("div", {ref: el => { mapContainer = el; }, class: "w-full h-full flex items-center justify-center"})
-                            )
-                        ),
-                        h("div", {class: () => activeTab() === 'louvain' ? "flex-1 flex flex-col space-y-2 overflow-y-auto" : "hidden"},
-                            h("div", {class: "flex flex-wrap items-center justify-between gap-1.5 bg-slate-50 p-2 rounded border border-slate-200 text-xs shrink-0"},
-                                h("div", {class: "font-mono text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200 text-[11px]"},
-                                    () => `Mod: ${graphData().modularity} | CC: ${graphData().clustering_coefficient}`
-                                ),
-                                h("div", {class: "flex flex-wrap items-center gap-1.5"},
-                                    h("select", {
-                                        value: embeddingLevel(), 
-                                        onChange: e => { setEmbeddingLevel(e.target.value); fetchGraphCommunities(); }, 
-                                        class: "px-1.5 py-0.5 border border-slate-200 rounded font-mono text-[11px] bg-white"
-                                    },
-                                        h("option", {value: "chunk"}, "Chunk"),
-                                        h("option", {value: "document"}, "Doc"),
-                                        h("option", {value: "county"}, "County"),
-                                        h("option", {value: "state"}, "State")
-                                    ),
-                                    h("select", {
-                                        value: tldFilter(),
-                                        onChange: e => {
-                                            setTldFilter(e.target.value);
-                                            if (graphContainer) renderCanvasGraph(graphData());
-                                        },
-                                        class: "px-1.5 py-0.5 border border-slate-200 rounded font-mono text-[11px] bg-white"
-                                    },
-                                        h("option", {value: "all"}, "All TLD"),
-                                        h("option", {value: "gov"}, ".gov"),
-                                        h("option", {value: "edu"}, ".edu")
-                                    ),
-                                    h("input", {
-                                        ref: el => sampleSizeInput = el,
-                                        type: "number", min: "10", max: "1000", value: "150", title: "Sample Size",
-                                        class: "w-12 px-1 py-0.5 border border-slate-200 rounded font-mono text-[11px] text-center bg-white"
-                                    }),
-                                    h("input", {
-                                        ref: el => targetPartitionsInput = el,
-                                        type: "number", min: "1", max: "20", value: "5", title: "Partitions",
-                                        class: "w-9 px-1 py-0.5 border border-slate-200 rounded font-mono text-[11px] text-center bg-white"
-                                    }),
-                                    h("button", {onClick: fetchGraphCommunities, class: "px-2 py-0.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-medium rounded transition text-[11px]"}, "Run"),
-                                    h("button", {onClick: graphZoomIn, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[11px] font-bold"}, "+"),
-                                    h("button", {onClick: graphZoomOut, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[11px] font-bold"}, "-"),
-                                    h("button", {onClick: graphZoomReset, class: "px-1.5 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[10px]"}, "Rst")
-                                )
-                            ),
-                            h("div", {class: "flex items-center justify-between gap-2 bg-slate-50 p-2 rounded border border-slate-200 text-xs shrink-0"},
-                                h("div", {class: "flex-1 flex items-center gap-2"},
-                                    h("input", {
-                                        type: "text",
-                                        value: nodeSearchQuery(),
-                                        onInput: e => {
-                                            setNodeSearchQuery(e.target.value);
-                                            if (graphContainer) renderCanvasGraph(graphData());
-                                        },
-                                        placeholder: "Search nodes by keyword...",
-                                        class: "w-full px-3 py-1 border border-slate-200 rounded font-mono text-xs bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                                    })
-                                ),
-                                h("button", {
-                                    onClick: () => setPinMode(!pinMode()),
-                                    classList: {
-                                        "px-3 py-1 rounded text-xs font-mono font-semibold transition shrink-0 flex items-center gap-1.5": true,
-                                        "bg-indigo-600 text-white shadow-xs": pinMode(),
-                                        "bg-white text-slate-700 border border-slate-200 hover:bg-slate-100": !pinMode()
-                                    }
-                                }, () => pinMode() ? "Pin Mode: ON" : "Pin Mode: OFF")
-                            ),
-                            () => embeddingStatus() && h("div", {class: "text-[11px] font-mono text-indigo-700 bg-indigo-50 p-1 rounded border border-indigo-200 shrink-0"}, () => embeddingStatus()),
-                            h("div", {class: "relative w-full"},
-                                h("div", {ref: el => { graphContainer = el; }, class: "w-full bg-slate-50 rounded border border-slate-200/60 p-1 min-h-[300px] max-h-[340px] flex items-center justify-center overflow-hidden relative shrink-0"}),
-                                () => hoveredNode() && h("div", {
-                                    style: () => `left: ${Math.min(Math.max(10, hoverPos().x - 120), 550)}px; top: ${Math.max(10, hoverPos().y - 90)}px;`,
-                                    class: "absolute z-50 bg-slate-900/95 text-white p-2.5 rounded-lg shadow-xl font-mono text-[11px] max-w-xs pointer-events-none space-y-1 border border-slate-700 backdrop-blur-xs"
-                                },
-                                    h("div", {class: "flex justify-between items-center text-indigo-300 border-b border-slate-700 pb-1"},
-                                        h("span", {}, `Node #${hoveredNode().id} (Group ${hoveredNode().group})`),
-                                        h("span", {}, `${hoveredNode().text_length} chars`)
-                                    ),
-                                    h("p", {class: "italic text-slate-200 leading-tight line-clamp-3"}, `"${hoveredNode().full_text}"`),
-                                    hoveredNode().pdf_url && h("div", {class: "truncate text-[10px] text-indigo-400 pt-0.5"}, `PDF: ${hoveredNode().pdf_url}`)
-                                )
-                            ),
-                            h("div", {class: "grid grid-cols-1 md:grid-cols-2 gap-3 flex-1 min-h-[200px]"},
-                                h("div", {class: "bg-white p-3 rounded-lg border border-slate-200 text-xs font-mono space-y-2 shadow-2xs flex flex-col h-full"},
-                                    h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-1.5 shrink-0"},
-                                        h("span", {class: "font-bold text-slate-900 tracking-wider uppercase text-[10px]"}, () => `Pinned Nodes (${pinnedNodes().length})`),
-                                        () => pinnedNodes().length > 0 && h("button", {onClick: () => setPinnedNodes([]), class: "text-[11px] text-rose-600 hover:underline font-semibold"}, "Clear All")
-                                    ),
-                                    h("div", {class: "flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]"},
-                                        () => pinnedNodes().length === 0 ? h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "Turn Pin Mode ON and click nodes on the canvas to pin them here.") :
-                                        pinnedNodes().map(node => h("div", {class: "bg-slate-50 p-2.5 rounded border border-slate-200 space-y-1.5 relative text-[11px] flex items-start justify-between gap-2"},
-                                            h("div", {class: "space-y-1 flex-1 min-w-0"},
-                                                h("div", {class: "flex items-center gap-2 font-semibold text-slate-900"},
-                                                    h("span", {class: "bg-indigo-100 text-indigo-800 px-1 py-0.5 rounded text-[9px]"}, `Group #${node.group}`),
-                                                    h("span", {class: "text-slate-500 text-[10px]"}, `ID: ${node.id}`)
-                                                ),
-                                                h("p", {class: "text-slate-700 italic leading-relaxed"}, `"${node.full_text}"`),
-                                                node.pdf_url && h("div", {class: "truncate pt-0.5"},
-                                                    h("a", {href: node.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px] font-semibold"}, `PDF: ${node.pdf_url}`)
-                                                )
-                                            ),
-                                            h("button", {onClick: () => setPinnedNodes(pinnedNodes().filter(p => p.id !== node.id)), class: "text-slate-400 hover:text-rose-600 font-bold shrink-0"}, "✕")
-                                        ))
-                                    )
-                                ),
-                                h("div", {class: "bg-white p-3 rounded-lg border border-slate-200 text-xs font-mono space-y-2 shadow-2xs flex flex-col h-full"},
-                                    h("div", {class: "flex justify-between items-center border-b border-slate-100 pb-1.5 shrink-0"},
-                                        h("span", {class: "font-bold text-slate-900 tracking-wider uppercase text-[10px]"}, () => {
-                                            const query = nodeSearchQuery().toLowerCase().trim();
-                                            if (!query) return "Search Matches (0)";
-                                            const matches = graphData().nodes.filter(n => n.full_text.toLowerCase().includes(query) || String(n.id).includes(query) || String(n.group).includes(query));
-                                            return `Search Matches (${matches.length})`;
+                            ]),
+                            h("div", {class: "bg-slate-100 rounded-lg p-2 font-mono text-[11px] border border-slate-200 space-y-1 shrink-0"}, [
+                                h("div", {class: "text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1"}, "Live Stream Logs"),
+                                h("div", {class: "space-y-1"}, logs().slice(0, 4).map(l => h("div", {class: "flex items-start gap-2 text-slate-700 border-b border-slate-200/60 pb-0.5"}, [
+                                    h("span", {class: "text-slate-400 shrink-0"}, `[${l.time}]`),
+                                    h("span", {class: "px-1 py-0.2 rounded text-[9px] font-bold uppercase bg-emerald-100 text-emerald-800 shrink-0"}, l.type),
+                                    h("span", {class: "break-all text-slate-800"}, l.message)
+                                ])))
+                            ])
+                        ]),
+
+                        /* Search Tab Panel */
+                        h("div", {style: () => state.activeTab === 'search' ? "display: flex; flex-direction: column; gap: 12px; width: 100%;" : "display: none;"}, [
+                            h("div", {class: "sticky top-0 z-40 bg-white pt-1 pb-2 space-y-3 shadow-xs"}, [
+                                h("div", {class: "flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-2.5 rounded border border-slate-200 text-xs shrink-0 max-w-full"}, [
+                                    h("form", {onSubmit: handleSearchSubmit, class: "flex-1 flex gap-2 min-w-[280px] max-w-full"}, [
+                                        h("input", {
+                                            value: () => state.q,
+                                            onInput: e => setState("q", e.target.value),
+                                            placeholder: "Search semantic vector space & partition clusters...",
+                                            class: "w-full px-3 py-1.5 border border-slate-200 rounded font-mono text-xs bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                                         }),
-                                        () => nodeSearchQuery() && h("span", {class: "text-[10px] text-slate-400"}, "Keyword Match")
-                                    ),
-                                    h("div", {class: "flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]"},
-                                        () => {
-                                            const query = nodeSearchQuery().toLowerCase().trim();
-                                            if (!query) {
-                                                return h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "Type a keyword above to view matching canvas nodes and relevance scores.");
-                                            }
-                                            const matches = graphData().nodes.filter(n => n.full_text.toLowerCase().includes(query) || String(n.id).includes(query) || String(n.group).includes(query));
-                                            if (matches.length === 0) {
-                                                return h("p", {class: "text-slate-400 italic text-center py-8 text-[11px]"}, "No matching nodes found for this keyword.");
-                                            }
-                                            return matches.map(node => {
-                                                const score = (0.75 + Math.min(0.24, node.full_text.toLowerCase().split(query).length * 0.05)).toFixed(2);
-                                                return h("div", {class: "bg-slate-50 p-2.5 rounded border border-slate-200 space-y-1.5 relative text-[11px]"},
-                                                    h("div", {class: "flex justify-between items-center font-semibold text-slate-900"},
-                                                        h("span", {class: "bg-indigo-100 text-indigo-800 px-1 py-0.5 rounded text-[9px]"}, `Group #${node.group}`),
-                                                        h("span", {class: "text-emerald-600 font-mono text-[10px] font-bold"}, `Score: ${score}`)
-                                                    ),
-                                                    h("p", {class: "text-slate-700 italic leading-relaxed"}, `"${node.full_text}"`),
-                                                    node.pdf_url && h("div", {class: "truncate pt-0.5"},
-                                                        h("a", {href: node.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px] font-semibold"}, `PDF: ${node.pdf_url}`)
-                                                    )
-                                                );
-                                            });
-                                        }
-                                    )
-                                )
-                            )
-                        ),
-                        h("div", {class: () => activeTab() === 'search' ? "flex-1 flex flex-col space-y-3 overflow-y-auto pr-1" : "hidden"},
-                            h("div", {class: "space-y-3"},
-                                h("div", {},
-                                    h("h2", {class: "text-sm font-semibold text-slate-900"}, "Document Search"),
-                                    h("p", {class: "text-xs text-slate-500 mt-0.5"}, "Query semantic indexes across all crawled and embedded PDF documents.")
-                                ),
-                                h("form", {onSubmit: search, class: "flex gap-2 w-full"},
-                                    h("input", {value: q(), onInput: e => setQ(e.target.value), placeholder: "Search semantic indexes across .gov and .edu PDFs...", class: "w-full px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-slate-900/10"}),
-                                    h("button", {type: "submit", class: "px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg shrink-0 transition flex items-center gap-2"},
-                                        () => isSearching() ? [
-                                            h("svg", {class: "animate-spin h-4 w-4 text-white", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24"},
-                                                h("circle", {class: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", "stroke-width": "4"}),
-                                                h("path", {class: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"})
-                                            ),
-                                            "Searching..."
-                                        ] : "Search"
-                                    )
-                                ),
-                                () => isSearching() && h("div", {class: "text-xs font-mono text-indigo-600 bg-indigo-50 p-3 rounded border border-indigo-200 flex items-center gap-2 animate-pulse"},
-                                    "Evaluating semantic vector similarities across indexes..."
-                                ),
-                                () => res().length > 0 && h("section", {class: "space-y-2 pt-2 border-t border-slate-100"},
-                                    h("h2", {class: "text-xs font-semibold uppercase tracking-wider text-slate-400"}, "Search Results"),
-                                    res().map(r => h("article", {class: "bg-white p-3 rounded-lg border border-slate-200/80 shadow-xs space-y-1.5 font-mono"},
-                                        h("div", {class: "flex justify-between items-center"},
-                                            h("div", {class: "flex items-center gap-3"},
-                                                h("span", {class: "text-emerald-600 font-semibold text-xs"}, `Score: ${r.score}`),
-                                                h("span", {class: "text-slate-500 text-xs"}, `Length: ${r.chunk_length} chars`),
-                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans"}, r.domain)
-                                            ),
-                                            h("span", {class: "text-xs text-slate-500"}, `${r.county}, ${r.state}`)
-                                        ),
-                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded border border-slate-100 italic"}, `"${r.chunk}"`),
-                                        r.pdf_url && h("div", {class: "truncate pt-0.5"},
-                                            h("a", {href: r.pdf_url, target: "_blank", class: "text-indigo-600 hover:underline text-[10px]"}, `PDF: ${r.pdf_url}`)
+                                        h("button", {type: "submit", class: "px-4 py-1.5 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded transition shrink-0"}, () => searchResultResource.loading ? "Searching..." : "Search"),
+                                        () => state.graphLoading && h("button", {type: "button", onClick: cancelSearch, class: "px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white font-medium rounded transition shrink-0 text-xs"}, "Cancel")
+                                    ]),
+                                    h("div", {class: "flex flex-wrap items-center gap-2 font-mono text-[11px]"}, [
+                                        h("div", {class: "flex items-center gap-1.5"}, [
+                                            h("span", {}, "Partitions:"),
+                                            h("input", {ref: el => { targetPartitionsInput = el; }, type: "number", value: "5", min: "1", max: "20", class: "w-12 px-1 py-1 border rounded text-center bg-white"})
+                                        ]),
+                                        h("div", {class: "flex items-center gap-1 bg-white border border-slate-200 px-2 py-1 rounded"}, [
+                                            h("label", {class: "flex items-center gap-1 cursor-pointer text-slate-700 font-medium"}, [
+                                                h("input", {type: "checkbox", checked: state.exhaustive, onChange: e => setState("exhaustive", e.target.checked), class: "rounded border-slate-300 text-emerald-600"}), "Exhaustive"
+                                            ])
+                                        ]),
+                                        h("select", {value: state.tldFilter, onChange: e => { setState("tldFilter", e.target.value); if (graphContainer) renderCanvasGraph(state.graphData); }, class: "px-1.5 py-1 border border-slate-200 rounded font-mono text-[11px] bg-white"},
+                                            ['all', 'gov', 'edu', 'mil', 'wiki'].map(v => h("option", {value: v}, v === 'all' ? 'All Sources' : `.${v}`))
                                         )
-                                    ))
-                                )
-                            )
-                        )
+                                    ])
+                                ]),
+                                
+                                h("div", {ref: el => { graphWrapperRef = el; }, class: () => state.isGraphFullscreen ? "fixed inset-0 z-50 bg-slate-900/95 p-6 flex flex-col justify-center items-center max-w-full" : "bg-white w-full shrink-0 max-w-full shadow-sm pb-1.5 relative"}, [
+                                    h("div", {class: "absolute top-2 right-2 z-30 flex items-center gap-1 bg-white/90 p-1 rounded shadow border border-slate-200"}, [
+                                        h("button", {onClick: () => setState("pinMode", !state.pinMode), class: () => `px-2.5 py-0.5 rounded font-medium text-xs ${state.pinMode ? 'bg-amber-600 text-white' : 'bg-white border text-slate-700'}`}, () => state.pinMode ? `Pinned (${state.pinnedNodes.length})` : "Pin Mode"),
+                                        h("span", {class: "text-slate-300 mx-0.5"}, "|"),
+                                        h("button", {onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 1.3), class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 font-bold text-xs"}, "+"),
+                                        h("button", {onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 0.7), class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 font-bold text-xs"}, "-"),
+                                        h("button", {onClick: () => { setState("pinnedNodes", []); zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.transform, d3.zoomIdentity); }, class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[10px]"}, "Reset"),
+                                        h("button", {onClick: () => setState("isGraphFullscreen", !state.isGraphFullscreen), class: "px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-bold text-[10px]"}, () => state.isGraphFullscreen ? "Exit Fullscreen" : "Maximize")
+                                    ]),
+                                    h("div", {ref: el => { graphContainer = el; }, class: () => state.isGraphFullscreen ? "w-full max-w-6xl h-[80vh] bg-white rounded shadow-xl p-2 relative flex items-center justify-center overflow-hidden" : "w-full bg-slate-50 rounded border border-slate-200/60 p-1 min-h-[540px] max-h-[540px] flex items-center justify-center overflow-hidden relative"}, [
+                                        () => state.graphLoading && h("div", {class: "absolute inset-0 bg-slate-50/80 backdrop-blur-xs flex flex-col items-center justify-center z-30 space-y-2"}, [
+                                            h("div", {class: "w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
+                                            h("span", {class: "text-xs font-mono text-slate-600 font-semibold"}, "Computing Louvain Partitions & Embeddings...")
+                                        ])
+                                    ]),
+                                    () => hoveredNode() && h("div", {style: `left: ${Math.min(Math.max(10, hoverPos().x - 120), 750)}px; top: ${Math.max(10, hoverPos().y - 90)}px;`, class: "absolute z-50 bg-slate-900/95 text-white p-2.5 rounded-lg shadow-xl font-mono text-[11px] max-w-xs pointer-events-none space-y-1 border border-slate-700"}, [
+                                        h("div", {class: "flex justify-between text-emerald-300 border-b border-slate-700 pb-1"}, [
+                                            h("span", {}, `Node #${hoveredNode().id}`),
+                                            h("span", {}, `${hoveredNode().text_length} chars`)
+                                        ]),
+                                        h("p", {class: "italic text-slate-200 line-clamp-3"}, `"${hoveredNode().full_text}"`)
+                                    ])
+                                ])
+                            ]),
+                            
+                            h("div", {class: "space-y-2.5 pt-3 w-full"}, [
+                                h("div", {class: "sticky top-[640px] z-20 bg-white py-2 border-b border-slate-200 flex justify-between items-center shrink-0 max-w-full shadow-md"}, [
+                                    h("div", {class: "flex items-center gap-2"}, [
+                                        h("button", {onClick: () => setState("bottomPaneTab", 'results'), class: () => `text-xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded transition flex items-center gap-2 ${state.bottomPaneTab === 'results' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
+                                            "Search Matches",
+                                            h("span", {class: "bg-slate-200 text-slate-800 px-1.5 py-0.2 rounded-full text-[10px] font-bold"}, () => searchResultResource()?.length || 0)
+                                        ]),
+                                        h("button", {onClick: () => setState("bottomPaneTab", 'pinned'), class: () => `text-xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded transition flex items-center gap-2 ${state.bottomPaneTab === 'pinned' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
+                                            "Pinned Nodes",
+                                            h("span", {class: "bg-slate-200 text-slate-800 px-1.5 py-0.2 rounded-full text-[10px] font-bold"}, () => state.pinnedNodes.length)
+                                        ])
+                                    ]),
+                                    h("div", {class: "flex items-center gap-3 font-mono text-[11px] text-slate-600 bg-slate-50 px-2.5 py-1 rounded border border-slate-200"}, [
+                                        h("span", {}, () => `Modularity: ${state.graphData.modularity ?? 0.0}`),
+                                        h("span", {class: "text-slate-300"}, "|"),
+                                        h("span", {}, () => `Clustering: ${state.graphData.clustering_coefficient ?? 0.0}`)
+                                    ])
+                                ]),
+                                h(Suspense, {
+                                    get children() {
+                                        return h("div", {class: "space-y-3 w-full relative z-0"}, [
+                                            state.bottomPaneTab === 'results' ? (
+                                                !searchResultResource() || searchResultResource().length === 0 ? h("p", {class: "text-slate-400 italic text-center py-6 text-xs"}, searchResultResource.loading ? "Searching vector space..." : "Enter a query above to retrieve semantically matching items.") :
+                                                h("div", {class: "space-y-3 w-full"}, [
+                                                    searchResultResource().slice(0, state.displayLimit).map(r => h("article", {class: "bg-white p-3.5 rounded-lg border border-slate-200 shadow-2xs space-y-1.5 font-mono w-full box-border overflow-hidden"}, [
+                                                        h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
+                                                            h("div", {class: "flex items-center gap-3 max-w-full truncate"}, [
+                                                                h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${r.score}`),
+                                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans truncate"}, r.domain)
+                                                            ]),
+                                                            h("span", {class: "text-xs text-slate-500 shrink-0"}, `${r.county}, ${r.state}`)
+                                                        ]),
+                                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded italic break-all whitespace-normal max-w-full"}, `"${r.chunk}"`),
+                                                        r.pdf_url && h("a", {href: r.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, r.pdf_url)
+                                                    ])),
+                                                    state.displayLimit < searchResultResource().length && h("div", {class: "flex justify-center pt-2 pb-4"}, [
+                                                        h("button", {onClick: () => setState("displayLimit", state.displayLimit + 20), class: "px-4 py-2 bg-slate-900 text-white text-xs font-semibold rounded hover:bg-slate-800 transition"}, "Load More Results (+20)")
+                                                    ])
+                                                ])
+                                            ) : (
+                                                !state.pinnedNodes.length ? h("p", {class: "text-slate-400 italic text-center py-6 text-xs"}, "No nodes pinned. Click nodes on the graph while pinning mode is active.") :
+                                                h("div", {class: "space-y-2 w-full"}, [
+                                                    state.pinnedNodes.map(p => h("article", {class: "bg-white p-3.5 rounded-lg border border-slate-200 shadow-2xs space-y-1.5 font-mono w-full box-border overflow-hidden"}, [
+                                                        h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
+                                                            h("div", {class: "flex items-center gap-3 max-w-full truncate"}, [
+                                                                h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${p.relevance !== undefined ? p.relevance.toFixed(3) : '1.000'}`),
+                                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans truncate"}, p.pdf_url ? new URL(p.pdf_url).hostname : "Pinned Node")
+                                                            ]),
+                                                            h("div", {class: "flex items-center gap-2 shrink-0"}, [
+                                                                h("span", {class: "text-xs text-slate-500"}, `${p.county || 'National'}, ${p.state || 'US'}`),
+                                                                h("button", {onClick: () => setState("pinnedNodes", state.pinnedNodes.filter(n => n.id !== p.id)), class: "text-slate-400 hover:text-red-600 font-bold ml-2"}, "×")
+                                                            ])
+                                                        ]),
+                                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded italic break-all whitespace-normal max-w-full"}, `"${p.full_text}"`),
+                                                        p.pdf_url && h("a", {href: p.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, p.pdf_url)
+                                                    ]))
+                                                ])
+                                            )
+                                        ]);
+                                    }
+                                })
+                            ])
+                        ])
                     )
                 )
             );
