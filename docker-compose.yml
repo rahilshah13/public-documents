@@ -231,7 +231,8 @@ services:
             pgvector==0.2.5 \
             websockets==12.0 \
             networkx==3.2.1 \
-            mwparserfromhell==0.7.2
+            mwparserfromhell==0.7.2 \
+            reportlab==4.1.0
 
         RUN cat <<'EOF' > abbr_map.json
         {

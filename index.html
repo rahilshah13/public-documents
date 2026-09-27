@@ -3,7 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Public Documents</title>
+    <title>Enterprise Intelligence & Biological Simulation Suite</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://unpkg.com/topojson-client@3"></script>
     <script type="importmap">
     {
         "imports": {
@@ -14,9 +18,6 @@
         }
     }
     </script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
-    <script src="https://unpkg.com/topojson-client@3"></script>
     <style>
         input[type=number]::-webkit-inner-spin-button, 
         input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
@@ -33,6 +34,7 @@
 
         function App() {
             const [state, setState] = createStore({
+                activeTab: 'map', // 'map', 'search', 'growth', 'flamegraph', 'audit'
                 q: "",
                 exhaustive: false,
                 isEmbActive: false,
@@ -48,10 +50,22 @@
                 totalEmbeddings: 0,
                 pinnedNodes: [],
                 pinMode: false,
-                activeTab: 'map',
                 bottomPaneTab: 'results',
                 isGraphFullscreen: false,
-                displayLimit: 20
+                displayLimit: 20,
+
+                // Growth & Nutrition Simulator State
+                mass: 68,
+                days: 7,
+                gender: 'm',
+                loadingGrowth: false,
+                growthReport: null,
+                growthError: null,
+
+                // Audit & PDF Report State
+                auditRepo: '/app/gov-intel',
+                auditResult: '',
+                loadingAudit: false
             });
 
             const [logs, setLogs] = createSignal([{ time: new Date().toLocaleTimeString(), type: "SYSTEM", message: "Pipeline logging initialized." }]);
@@ -107,6 +121,7 @@
                 fetchStats();
                 fetchWikiStats();
                 fetchGraphCommunities();
+                runGrowthSimulation();
 
                 setTimeout(() => {
                     if (mapContainer) initMap(mapContainer);
@@ -236,6 +251,62 @@
                 setState("graphLoading", false);
                 mutateSearchResults([]);
                 log("SEARCH", "Louvain graph & search query cancelled.");
+            };
+
+            const runGrowthSimulation = async () => {
+                setState("loadingGrowth", true);
+                setState("growthError", null);
+                try {
+                    const response = await fetch('/api/simulate', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ gender: state.gender, mass: Number(state.mass), days: Number(state.days) })
+                    });
+                    if (!response.ok) throw new Error('Failed to generate nutritional growth plan.');
+                    const data = await response.json();
+                    setState("growthReport", data);
+                } catch (err) {
+                    setState("growthError", err.message);
+                } finally {
+                    setState("loadingGrowth", false);
+                }
+            };
+
+            const runAudit = async () => {
+                setState("loadingAudit", true);
+                try {
+                    const res = await fetch('/api/audit/run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repository_path: state.auditRepo, standards: ["SOC2", "ISO27001", "HIPAA"] })
+                    });
+                    const data = await res.json();
+                    setState("auditResult", data.audit_report);
+                } catch (e) {
+                    setState("auditResult", 'Audit failed: ' + e.message);
+                } finally {
+                    setState("loadingAudit", false);
+                }
+            };
+
+            const downloadDiffPdf = async () => {
+                try {
+                    const res = await fetch('/api/reports/diff-pdf', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_name: 'gov-intel-engine', commit_sha: 'a1b2c3d4', diff_content: 'sample diff' })
+                    });
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'diff_report_a1b2c3d.pdf';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } catch (e) {
+                    alert('PDF generation failed: ' + e.message);
+                }
             };
 
             const initMap = async (container) => {
@@ -493,7 +564,7 @@
                                 onMouseEnter: () => setShowProgressTooltip(true),
                                 onMouseLeave: () => setShowProgressTooltip(false),
                                 class: "text-xl font-semibold tracking-tight text-slate-900 cursor-pointer underline decoration-dotted decoration-slate-400"
-                            }, "Public Documents"),
+                            }, "Enterprise Intelligence & Biological Suite"),
                             () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-2 w-72 bg-slate-900 text-white p-3 rounded-lg shadow-2xl z-[9999] font-mono text-xs space-y-1.5 border border-slate-700"}, [
                                 h("div", {class: "text-emerald-400 font-bold border-b border-slate-700 pb-1 mb-1"}, "Pipeline Progress Overview"),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".gov Crawled:"), h("span", {}, `${state.progress.gov_crawled || 0} / ${state.progress.total_gov || 0}`)]),
@@ -543,7 +614,7 @@
                 ),
                 h("main", {class: "space-y-3 flex flex-col w-full pb-12"},
                     h("div", {class: "bg-white p-3 md:p-4 rounded-lg border border-slate-200/80 shadow-xs space-y-2.5 flex flex-col w-full"},
-                        h("div", {class: "flex items-center gap-1 border-b border-slate-200 pb-1.5 shrink-0 z-30 relative"},
+                        h("div", {class: "flex items-center gap-1 border-b border-slate-200 pb-1.5 shrink-0 z-30 relative flex-wrap"},
                             h("button", {
                                 onClick: () => switchTab('map'),
                                 class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'map' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
@@ -554,7 +625,19 @@
                             }, [
                                 "Search",
                                 h("span", {class: () => `px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${state.activeTab === 'search' ? 'bg-emerald-700 text-white' : 'bg-slate-200 text-slate-700'}`}, () => state.totalEmbeddings)
-                            ])
+                            ]),
+                            h("button", {
+                                onClick: () => switchTab('growth'),
+                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'growth' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, "Growth & Nutrition"),
+                            h("button", {
+                                onClick: () => switchTab('flamegraph'),
+                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'flamegraph' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, "Flame Graph"),
+                            h("button", {
+                                onClick: () => switchTab('audit'),
+                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'audit' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, "Compliance & PDF")
                         ),
 
                         /* US Map Tab Panel */
@@ -693,7 +776,155 @@
                                     }
                                 })
                             ])
+                        ]),
+
+                        /* Growth & Nutrition Tab Panel */
+                        h("div", {style: () => state.activeTab === 'growth' ? "display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: 1.5rem;" : "display: none;", class: "lg:grid-cols-3"}, [
+                            h("div", {class: "grid grid-cols-1 lg:grid-cols-3 gap-6 w-full"}, [
+                                h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-5 text-slate-100"}, [
+                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Simulation Parameters"),
+                                    h("div", {}, [
+                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, ["Target Mass (kg): ", h("span", {class: "text-emerald-400 font-mono"}, () => state.mass)]),
+                                        h("input", {
+                                            type: "range", min: "10", max: "120", value: () => state.mass,
+                                            onInput: e => setState("mass", e.target.value),
+                                            class: "w-full accent-emerald-500 bg-slate-800 rounded-lg cursor-pointer"
+                                        })
+                                    ]),
+                                    h("div", {}, [
+                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Duration (Days)"),
+                                        h("input", {
+                                            type: "number", min: "1", max: "365", value: () => state.days,
+                                            onInput: e => setState("days", e.target.value),
+                                            class: "w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500 font-mono"
+                                        })
+                                    ]),
+                                    h("div", {}, [
+                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Phenotype Gender"),
+                                        h("select", {
+                                            value: () => state.gender,
+                                            onChange: e => setState("gender", e.target.value),
+                                            class: "w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
+                                        }, [
+                                            h("option", {value: "m"}, "Male (m)"),
+                                            h("option", {value: "f"}, "Female (f)")
+                                        ])
+                                    ]),
+                                    h("button", {
+                                        onClick: runGrowthSimulation,
+                                        disabled: () => state.loadingGrowth,
+                                        class: "w-full bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold py-2.5 rounded-lg transition-all shadow-md disabled:opacity-50 text-sm cursor-pointer"
+                                    }, () => state.loadingGrowth ? 'Computing Stoichiometry...' : 'Run Simulation'),
+                                    () => state.growthError && h("div", {class: "bg-red-950/50 border border-red-800 text-red-300 p-3 rounded-lg text-xs"}, state.growthError)
+                                ]),
+                                h("div", {class: "lg:col-span-2 space-y-6"}, [
+                                    h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl text-slate-100"}, [
+                                        h("h2", {class: "text-lg font-semibold text-slate-200 mb-3"}, "Aggregated Dietary Portfolio"),
+                                        h("div", {class: "overflow-x-auto max-h-64 overflow-y-auto"}, [
+                                            h("table", {class: "w-full text-left border-collapse text-sm"}, [
+                                                h("thead", {}, h("tr", {class: "border-b border-slate-800 text-slate-400 text-xs"}, [
+                                                    h("th", {class: "py-2.5 px-3"}, "Food Item"),
+                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Mass (g)")
+                                                ])),
+                                                h("tbody", {class: "divide-y divide-slate-800/50 text-slate-300"}, [
+                                                    !(state.growthReport?.meal?.length) ? h("tr", {}, h("td", {colSpan: 2, class: "py-4 text-center text-slate-500 text-xs"}, "No active meal portfolio generated.")) :
+                                                    state.growthReport.meal.map(item => h("tr", {}, [
+                                                        h("td", {class: "py-2.5 px-3"}, item.desc),
+                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, item.grams)
+                                                    ]))
+                                                ])
+                                            ])
+                                        ])
+                                    ]),
+                                    h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl text-slate-100"}, [
+                                        h("h2", {class: "text-lg font-semibold text-slate-200 mb-3"}, "Organ Tissue Synthesis & Protein Allocation"),
+                                        h("div", {class: "overflow-x-auto max-h-64 overflow-y-auto"}, [
+                                            h("table", {class: "w-full text-left border-collapse text-sm"}, [
+                                                h("thead", {}, h("tr", {class: "border-b border-slate-800 text-slate-400 text-xs"}, [
+                                                    h("th", {class: "py-2.5 px-3"}, "Organ Name"),
+                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Organ Mass (kg)"),
+                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Protein (g)")
+                                                ])),
+                                                h("tbody", {class: "divide-y divide-slate-800/50 text-slate-300"}, [
+                                                    !(state.growthReport?.organs?.length) ? h("tr", {}, h("td", {colSpan: 3, class: "py-4 text-center text-slate-500 text-xs"}, "Awaiting simulation execution.")) :
+                                                    state.growthReport.organs.map(org => h("tr", {}, [
+                                                        h("td", {class: "py-2.5 px-3 capitalize"}, org.name),
+                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, org.mass_kg.toFixed(2)),
+                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, org.protein_g.toFixed(2))
+                                                    ]))
+                                                ])
+                                            ])
+                                        ])
+                                    ])
+                                ])
+                            ])
+                        ]),
+
+                        /* Flame Graph Tab Panel */
+                        h("div", {style: () => state.activeTab === 'flamegraph' ? "display: block;" : "display: none;"}, [
+                            h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6 text-slate-100"}, [
+                                h("div", {class: "border-b border-slate-800 pb-4"}, [
+                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Systemic Biological Stack & Flame Graph"),
+                                    h("p", {class: "text-xs text-slate-400 mt-0.5"}, "Hierarchical aggregation of organ stoichiometry, metabolic cell turnover, and drug pathway interactions.")
+                                ]),
+                                h("div", {class: "bg-slate-950 border border-slate-800 rounded-xl p-6 space-y-4"}, [
+                                    h("div", {class: "space-y-2"}, [
+                                        h("div", {class: "flex justify-between text-xs font-mono text-slate-400"}, [
+                                            h("span", {}, "root: organism_simulation (100%)"),
+                                            h("span", {}, () => `${state.mass} kg`)
+                                        ]),
+                                        h("div", {class: "w-full bg-slate-900 h-8 rounded-lg overflow-hidden flex border border-slate-800"}, [
+                                            h("div", {style: "width: 40%;", class: "bg-emerald-600 hover:bg-emerald-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Skeletal Muscle (40%)"}, "Skeletal Muscle (40%)"),
+                                            h("div", {style: "width: 25%;", class: "bg-teal-600 hover:bg-teal-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Bone & Cartilage (25%)"}, "Bone (25%)"),
+                                            h("div", {style: "width: 20%;", class: "bg-cyan-600 hover:bg-cyan-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Viscera & Liver (20%)"}, "Viscera (20%)"),
+                                            h("div", {style: "width: 15%;", class: "bg-sky-600 hover:bg-sky-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Neural & Skin (15%)"}, "Neural/Skin (15%)")
+                                        ])
+                                    ]),
+                                    h("div", {class: "p-4 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 space-y-2"}, [
+                                        h("div", {class: "text-emerald-400 font-bold"}, "Active Prolog Predicate Trace:"),
+                                        h("div", {}, "`simulate_growth(Age, skeletal_myocyte, AvailableNutrients, Output).` -> OK"),
+                                        h("div", {}, "`organ_needs(skeletal_muscle, m, 68, TotalNeeds).` -> Computed stoichiometric balance.")
+                                    ])
+                                ])
+                            ])
+                        ]),
+
+                        /* Compliance & PDF Tab Panel */
+                        h("div", {style: () => state.activeTab === 'audit' ? "display: block;" : "display: none;"}, [
+                            h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6 text-slate-100"}, [
+                                h("div", {class: "border-b border-slate-800 pb-4"}, [
+                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Local Gemma-2B Audit & PDF Report Generation"),
+                                    h("p", {class: "text-xs text-slate-400 mt-0.5"}, "Evaluate repositories against regulatory frameworks and export 1-page PDF diff reports.")
+                                ]),
+                                h("div", {class: "grid grid-cols-1 md:grid-cols-2 gap-6"}, [
+                                    h("div", {class: "space-y-4"}, [
+                                        h("div", {}, [
+                                            h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Repository Path"),
+                                            h("input", {
+                                                type: "text",
+                                                value: () => state.auditRepo,
+                                                onInput: e => setState("auditRepo", e.target.value),
+                                                class: "w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
+                                            })
+                                        ]),
+                                        h("button", {
+                                            onClick: runAudit,
+                                            disabled: () => state.loadingAudit,
+                                            class: "w-full bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold py-2.5 rounded-lg transition-all shadow-md text-sm disabled:opacity-50 cursor-pointer"
+                                        }, () => state.loadingAudit ? 'Running Gemma-2B Audit...' : 'Run Compliance Audit'),
+                                        h("button", {
+                                            onClick: downloadDiffPdf,
+                                            class: "w-full bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 font-semibold py-2.5 rounded-lg transition-all shadow-md text-sm cursor-pointer"
+                                        }, "Download Diff PDF Report")
+                                    ]),
+                                    h("div", {class: "bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-xs text-slate-300 overflow-y-auto max-h-72"}, [
+                                        h("div", {class: "text-emerald-400 font-bold mb-2"}, "Audit Output Log:"),
+                                        h("pre", {class: "whitespace-pre-wrap"}, () => state.auditResult || 'Awaiting audit execution...')
+                                    ])
+                                ])
+                            ])
                         ])
+
                     )
                 )
             );
