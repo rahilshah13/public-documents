@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise Intelligence & Biological Simulation Suite</title>
+    <title>Enterprise Intelligence & Public Documents Crawler Suite</title>
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
@@ -22,10 +22,14 @@
         input[type=number]::-webkit-inner-spin-button, 
         input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type=number] { -moz-appearance: textfield; }
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 antialiased min-h-screen flex flex-col font-sans">
-    <div id="app" class="flex-1 flex flex-col w-full"></div>
+<body class="bg-slate-50 text-slate-900 antialiased h-screen flex flex-col font-sans overflow-hidden">
+    <div id="app" class="h-full flex flex-col w-full overflow-hidden"></div>
     <script type="module">
         import { createSignal, createMemo, createResource, onMount, createEffect, Suspense } from "solid-js";
         import { createStore } from "solid-js/store";
@@ -34,16 +38,15 @@
 
         function App() {
             const [state, setState] = createStore({
-                activeTab: 'map', // 'map', 'search', 'growth', 'flamegraph', 'audit'
+                activeTab: 'map',
                 q: "",
-                exhaustive: false,
                 isEmbActive: false,
                 progress: { visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, gov_completed: 0, wiki_crawled: 0, gov_crawled: 0, edu_crawled: 0, mil_crawled: 0, total_gov: 0, total_edu: 0, total_mil: 0, total_wiki: 6800000 },
                 isPaused: true,
                 graphData: { nodes: [], edges: [], community_count: 0, modularity: 0.0, clustering_coefficient: 0.0 },
                 graphLoading: false,
                 nodeQuery: "",
-                tldFilter: "all",
+                tldFilter: "gov",
                 wikiTotal: 0,
                 wikiTotalCount: 6800000,
                 pendingEmbeddings: 0,
@@ -53,19 +56,15 @@
                 bottomPaneTab: 'results',
                 isGraphFullscreen: false,
                 displayLimit: 20,
-
-                // Growth & Nutrition Simulator State
-                mass: 68,
-                days: 7,
-                gender: 'm',
-                loadingGrowth: false,
-                growthReport: null,
-                growthError: null,
-
-                // Audit & PDF Report State
-                auditRepo: '/app/gov-intel',
-                auditResult: '',
-                loadingAudit: false
+                catalogQuery: "",
+                catalogItems: [],
+                catalogPage: 1,
+                catalogPageSize: 50,
+                catalogTotalCount: 0,
+                loadingCatalog: false,
+                selectedDocIds: {},
+                runningCatalogLouvain: false,
+                actionStates: {}
             });
 
             const [logs, setLogs] = createSignal([{ time: new Date().toLocaleTimeString(), type: "SYSTEM", message: "Pipeline logging initialized." }]);
@@ -75,7 +74,6 @@
             const [searchTrigger, setSearchTrigger] = createSignal("");
             const [showProgressTooltip, setShowProgressTooltip] = createSignal(false);
 
-            let embeddingAbortController = null;
             let graphAbortController = null;
 
             const [searchResultResource, { mutate: mutateSearchResults }] = createResource(searchTrigger, async (query) => {
@@ -84,7 +82,7 @@
                     const resp = await fetch("/search", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ query, exhaustive: state.exhaustive })
+                        body: JSON.stringify({ query })
                     });
                     const r = await resp.json();
                     setState("displayLimit", 20);
@@ -94,7 +92,7 @@
                 }
             });
 
-            let mapContainer, graphContainer, sampleSizeInput, targetPartitionsInput, graphWrapperRef;
+            let mapContainer, graphContainer, sampleSizeInput, targetPartitionsInput;
             let statusMaps = { gov: {}, edu: {}, mil: {} };
             let zoomTransform = d3.zoomIdentity, zoomBehavior = null, simulation = null;
 
@@ -109,23 +107,19 @@
                             setState("wikiTotal", initState.progress.wiki_crawled);
                             setState("progress", "wiki_crawled", initState.progress.wiki_crawled);
                         }
-                        if (initState.progress.total_wiki !== undefined) {
-                            setState("wikiTotalCount", initState.progress.total_wiki);
-                            setState("progress", "total_wiki", initState.progress.total_wiki);
-                        }
                     }
-                    const statRes = await (await fetch("/crawler/status")).json();
+                    const statRes = await (await fetch("/crawler/status-legacy")).json();
                     setState("isPaused", statRes.paused);
                 } catch (e) {}
 
                 fetchStats();
                 fetchWikiStats();
                 fetchGraphCommunities();
-                runGrowthSimulation();
+                fetchCatalog(state.catalogPage);
 
                 setTimeout(() => {
                     if (mapContainer) initMap(mapContainer);
-                }, 100);
+                }, 50);
 
                 setInterval(async () => {
                     fetchWikiStats();
@@ -143,29 +137,30 @@
                                         setState("wikiTotal", d.stats.wiki_crawled);
                                         setState("progress", "wiki_crawled", d.stats.wiki_crawled);
                                     }
-                                    if (d.stats.total_wiki !== undefined) {
-                                        setState("wikiTotalCount", d.stats.total_wiki);
-                                        setState("progress", "total_wiki", d.stats.total_wiki);
-                                    }
-                                    log("PROGRESS", `Crawled: Visited=${d.stats.visited || 0}, PDFs=${d.stats.pdfs_discovered || 0}, Wiki=${d.stats.wiki_crawled || 0}`);
                                 }
-                            } else if (d.type === "pdf_found" || d.type === "document_discovered") {
-                                if (d.title) log("DISCOVERY", `Wiki Article: "${d.title}" (${d.pdf_url})`);
-                                else log("DISCOVERY", `Discovered document: ${d.pdf_url || 'Unknown URL'}`);
+                            } else if (d.type === "queue_update") {
+                                log("QUEUE", `Queue [${d.tld_type || 'gov'}]: Current target "${d.current || 'Unknown'} (${d.queue_len || 0} remaining)"`);
+                            } else if (d.type === "pdf_found" || d.type === "document_discovered" || d.type === "wiki_crawl" || d.type === "wiki_article" || d.type === "wiki_progress") {
+                                if (d.title || d.domain === "en.wikipedia.org" || d.type.includes("wiki")) {
+                                    log("WIKI", `Crawled Wiki Article: ${d.title || d.pdf_url || d.current || 'In Progress'}`);
+                                    setState("progress", "wiki_crawled", (state.progress.wiki_crawled || 0) + 1);
+                                    setState("wikiTotal", (state.wikiTotal || 0) + 1);
+                                } else {
+                                    log("DISCOVERY", `Discovered document: ${d.pdf_url || 'Unknown URL'}`);
+                                }
                                 fetchStats();
                                 fetchWikiStats();
-                            } else if (d.type === "domain_update" || d.type === "crawl_complete" || d.type === "wiki_crawl" || d.type === "wiki_article" || d.type === "wiki_progress") {
-                                if (d.domain === "en.wikipedia.org" || d.type.includes("wiki") || d.title) {
-                                    log("WIKI", `Crawled Wiki Article: ${d.title || d.url || d.domain || 'In Progress'}`);
-                                } else {
-                                    log("CRAWL", `Crawl complete for [${d.domain || 'Target'}]: ${d.status || 'SUCCESS'}`);
-                                }
+                                fetchCatalog(state.catalogPage);
+                            } else if (d.type === "domain_update" || d.type === "crawl_complete") {
+                                log("CRAWL", `Domain [${d.domain || 'Target'}]: Status -> ${d.status || 'SUCCESS'}`);
                                 fetchWikiStats();
+                                fetchCatalog(state.catalogPage);
                                 if (mapContainer && state.activeTab === 'map') updateMapColors();
                             } else if (d.type === "embedding_complete" || d.type === "vector_indexed") {
                                 log("EMBEDDING", "Vector embedding generated & stored.");
                                 fetchStats();
                                 fetchWikiStats();
+                                fetchCatalog(state.catalogPage);
                             } else if (d.message) {
                                 log(d.type || "INFO", d.message);
                             }
@@ -181,11 +176,81 @@
                     const r = await (await fetch("/wiki/status")).json();
                     setState("wikiTotal", r.total_downloaded || 0);
                     setState("progress", "wiki_crawled", r.total_downloaded || 0);
-                    if (r.total_wiki !== undefined) {
-                        setState("wikiTotalCount", r.total_wiki);
-                        setState("progress", "total_wiki", r.total_wiki);
-                    }
                 } catch (e) {}
+            };
+
+            const fetchCatalog = async (page = 1) => {
+                setState("loadingCatalog", true);
+                try {
+                    const r = await (await fetch(`/api/catalog?page=${page}&limit=${state.catalogPageSize}`)).json();
+                    setState("catalogItems", r.items || []);
+                    setState("catalogTotalCount", r.total || r.total_count || 0);
+                    setState("catalogPage", page);
+                } catch (e) {
+                    setState("catalogItems", []);
+                } finally {
+                    setState("loadingCatalog", false);
+                }
+            };
+
+            const filteredCatalogItems = createMemo(() => {
+                const q = state.catalogQuery.toLowerCase().trim();
+                const items = state.catalogItems || [];
+                if (!q) return items;
+                return items.filter(item => 
+                    (item.domain && item.domain.toLowerCase().includes(q)) || 
+                    (item.url && item.url.toLowerCase().includes(q)) ||
+                    (item.state && item.state.toLowerCase().includes(q)) ||
+                    (item.county && item.county.toLowerCase().includes(q))
+                );
+            });
+
+            const triggerScrapeAndEmbed = async (domain) => {
+                if (!domain) return;
+                setState("actionStates", domain, "scraping");
+                try {
+                    const res = await fetch("/api/catalog/scrape", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ domain })
+                    });
+                    const r = await res.json();
+                    log("SCRAPE", r.message || `Started scrape & embed for ${domain}`);
+                    setTimeout(() => fetchCatalog(state.catalogPage), 1500);
+                } catch (e) {
+                    alert("Failed to trigger scrape for " + domain);
+                } finally {
+                    setState("actionStates", domain, null);
+                }
+            };
+
+            const runFlaggedCatalogLouvain = async () => {
+                const docIds = Object.keys(state.selectedDocIds).filter(k => state.selectedDocIds[k]).map(Number);
+                if (docIds.length === 0) {
+                    alert("Please flag/select at least one document from the catalog first.");
+                    return;
+                }
+                setState("runningCatalogLouvain", true);
+                try {
+                    const res = await fetch("/graph-communities", { method: "GET" });
+                    const gRes = await res.json();
+                    setState("graphData", gRes);
+                    setState("activeTab", 'search');
+                    requestAnimationFrame(() => renderCanvasGraph(gRes));
+                } catch (e) {
+                    alert("Failed to run Louvain analysis on flagged documents: " + e.message);
+                } finally {
+                    setState("runningCatalogLouvain", false);
+                }
+            };
+
+            const downloadFlaggedZip = async () => {
+                const docIds = Object.keys(state.selectedDocIds).filter(k => state.selectedDocIds[k]).map(Number);
+                if (docIds.length === 0) {
+                    alert("Please select at least one document first.");
+                    return;
+                }
+                alert(`Preparing bundle for ${docIds.length} document(s).`);
             };
 
             createEffect(() => {
@@ -199,11 +264,11 @@
                 } else if (tab === 'search') {
                     requestAnimationFrame(() => {
                         setTimeout(() => {
-                            if (graphContainer) {
-                                renderCanvasGraph(state.graphData);
-                            }
+                            if (graphContainer) renderCanvasGraph(state.graphData);
                         }, 60);
                     });
+                } else if (tab === 'catalog') {
+                    fetchCatalog(state.catalogPage);
                 }
             });
 
@@ -213,34 +278,6 @@
                     setState("pendingEmbeddings", (r.total_documents || 0) - (r.processed_documents || 0));
                     setState("totalEmbeddings", r.total_embeddings || 0);
                 } catch (e) {}
-            };
-
-            const generateEmbeddings = async () => {
-                if (state.isEmbActive) {
-                    await fetch("/embeddings/cancel", { method: "POST" });
-                    setState("isEmbActive", false);
-                    return;
-                }
-                setState("isEmbActive", true);
-                embeddingAbortController = new AbortController();
-                try {
-                    const res = await fetch("/process-embeddings-stream", { signal: embeddingAbortController.signal });
-                    const reader = res.body.getReader();
-                    const decoder = new TextDecoder();
-                    while (true) {
-                        const { value, done } = await reader.read();
-                        if (done) break;
-                        for (const line of decoder.decode(value, { stream: true }).split("\n")) {
-                            if (line.startsWith("data: ")) {
-                                fetchStats();
-                            }
-                        }
-                    }
-                } catch (e) {
-                } finally {
-                    setState("isEmbActive", false);
-                    fetchStats();
-                }
             };
 
             const cancelSearch = () => {
@@ -253,62 +290,6 @@
                 log("SEARCH", "Louvain graph & search query cancelled.");
             };
 
-            const runGrowthSimulation = async () => {
-                setState("loadingGrowth", true);
-                setState("growthError", null);
-                try {
-                    const response = await fetch('/api/simulate', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ gender: state.gender, mass: Number(state.mass), days: Number(state.days) })
-                    });
-                    if (!response.ok) throw new Error('Failed to generate nutritional growth plan.');
-                    const data = await response.json();
-                    setState("growthReport", data);
-                } catch (err) {
-                    setState("growthError", err.message);
-                } finally {
-                    setState("loadingGrowth", false);
-                }
-            };
-
-            const runAudit = async () => {
-                setState("loadingAudit", true);
-                try {
-                    const res = await fetch('/api/audit/run', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ repository_path: state.auditRepo, standards: ["SOC2", "ISO27001", "HIPAA"] })
-                    });
-                    const data = await res.json();
-                    setState("auditResult", data.audit_report);
-                } catch (e) {
-                    setState("auditResult", 'Audit failed: ' + e.message);
-                } finally {
-                    setState("loadingAudit", false);
-                }
-            };
-
-            const downloadDiffPdf = async () => {
-                try {
-                    const res = await fetch('/api/reports/diff-pdf', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ repo_name: 'gov-intel-engine', commit_sha: 'a1b2c3d4', diff_content: 'sample diff' })
-                    });
-                    const blob = await res.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'diff_report_a1b2c3d.pdf';
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                } catch (e) {
-                    alert('PDF generation failed: ' + e.message);
-                }
-            };
-
             const initMap = async (container) => {
                 if (!container) return;
                 setMapLoading(true);
@@ -317,33 +298,21 @@
                 const usData = cached ? JSON.parse(cached) : await d3.json("https://cdn.jsdelivr.net/npm/us-atlas@3/counties-albers-10m.json");
                 if (!cached) localStorage.setItem("us_topo_json_cache", JSON.stringify(usData));
 
-                const svg = d3.select(container).append("svg").attr("viewBox", "0 0 960 720").attr("class", "w-full h-full max-h-[640px] object-contain");
+                const svg = d3.select(container).append("svg").attr("viewBox", "0 0 960 720").attr("class", "w-full h-full object-contain");
                 const path = d3.geoPath();
                 const counties = topojson.feature(usData, usData.objects.counties).features;
                 const states = topojson.feature(usData, usData.objects.states).features;
-                const countyNames = counties.map(d => d.properties.name).filter(Boolean);
-
-                let stateStats = {};
-                try {
-                    const [mapResp, statsResp] = await Promise.all([
-                        fetch("/map-status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counties: countyNames }) }),
-                        fetch("/state-stats")
-                    ]);
-                    const mapRes = await mapResp.json();
-                    statusMaps = { gov: mapRes.gov || {}, edu: mapRes.edu || {}, mil: mapRes.mil || {} };
-                    stateStats = await statsResp.json();
-                } catch (e) {}
 
                 let tooltip = d3.select(container).select(".map-tooltip");
-                if (tooltip.empty()) tooltip = d3.select(container).append("div").attr("class", "map-tooltip absolute hidden bg-slate-900 text-white text-xs rounded p-3 pointer-events-none shadow-xl z-50 font-mono");
+                if (tooltip.empty()) tooltip = d3.select(container).append("div").attr("class", "map-tooltip absolute hidden bg-slate-900 text-white text-xs rounded p-2 pointer-events-none shadow-lg z-50 font-mono");
 
                 svg.append("g").selectAll("path").data(counties).join("path")
                     .attr("d", path).attr("stroke", "#cbd5e1").attr("stroke-width", 0.2).attr("class", "county-path")
                     .attr("data-county", d => d.properties.name || "")
-                    .attr("fill", d => statusMaps.gov[d.properties.name] === 'COMPLETED' ? "#10b981" : (['CRAWLING', 'QUEUED'].includes(statusMaps.gov[d.properties.name]) ? "#f59e0b" : "#e2e8f0"))
+                    .attr("fill", "#e2e8f0")
                     .on("mousemove", (event, d) => {
                         const name = d.properties.name || "Unknown";
-                        tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>.gov: ${statusMaps.gov[name] || 'PENDING'}<br/>.edu: ${statusMaps.edu[name] || 'PENDING'}<br/>.mil: ${statusMaps.mil[name] || 'PENDING'}`);
+                        tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong>`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
@@ -352,14 +321,43 @@
                 svg.append("g").selectAll("path").data(states).join("path")
                     .attr("d", path).attr("fill", "transparent").attr("stroke", "#475569").attr("stroke-width", 0.6)
                     .on("mousemove", (event, d) => {
-                        const name = d.properties.name, stats = stateStats[name] || stateStats[name?.toUpperCase()] || stateStats[name?.toLowerCase()] || { gov_urls: 0, edu_urls: 0, mil_urls: 0, documents: 0, embeddings: 0 };
-                        tooltip.classed("hidden", false).html(`<strong>${name}</strong><br/>.gov: ${stats.gov_urls || stats.gov || 0} | .edu: ${stats.edu_urls || stats.edu || 0} | .mil: ${stats.mil_urls || stats.mil || 0}<br/>Docs: ${stats.documents || 0} | Embeddings: ${stats.embeddings || 0}`);
+                        const name = d.properties.name;
+                        tooltip.classed("hidden", false).html(`<strong>${name}</strong>`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
                     .on("mouseleave", () => tooltip.classed("hidden", true));
 
                 setMapLoading(false);
+
+                // Fetch status asynchronously in the background so the map renders instantly
+                try {
+                    const countyNames = counties.map(d => d.properties.name).filter(Boolean);
+                    const [mapResp, statsResp] = await Promise.all([
+                        fetch("/map-status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counties: countyNames }) }),
+                        fetch("/state-stats")
+                    ]);
+                    const mapRes = await mapResp.json();
+                    statusMaps = { gov: mapRes.gov || {}, edu: mapRes.edu || {}, mil: mapRes.mil || {} };
+                    const stateStats = await statsResp.json();
+
+                    svg.selectAll(".county-path")
+                        .attr("fill", d => statusMaps.gov[d.properties.name] === 'COMPLETED' ? "#10b981" : (['CRAWLING', 'QUEUED'].includes(statusMaps.gov[d.properties.name]) ? "#f59e0b" : "#e2e8f0"))
+                        .on("mousemove", (event, d) => {
+                            const name = d.properties.name || "Unknown";
+                            tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>.gov: ${statusMaps.gov[name] || 'PENDING'}<br/>.edu: ${statusMaps.edu[name] || 'PENDING'}<br/>.mil: ${statusMaps.mil[name] || 'PENDING'}`);
+                            const [x, y] = d3.pointer(event, container);
+                            tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
+                        });
+
+                    svg.selectAll("g path:not(.county-path)")
+                        .on("mousemove", (event, d) => {
+                            const name = d.properties.name, stats = stateStats[name] || stateStats[name?.toUpperCase()] || stateStats[name?.toLowerCase()] || { gov_urls: 0, edu_urls: 0, mil_urls: 0, documents: 0, embeddings: 0 };
+                            tooltip.classed("hidden", false).html(`<strong>${name}</strong><br/>.gov: ${stats.gov_urls || stats.gov || 0} | .edu: ${stats.edu_urls || stats.edu || 0} | .mil: ${stats.mil_urls || stats.mil || 0}<br/>Docs: ${stats.documents || 0} | Embeddings: ${stats.embeddings || 0}`);
+                            const [x, y] = d3.pointer(event, container);
+                            tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
+                        });
+                } catch (e) {}
             };
 
             const updateMapColors = async () => {
@@ -388,7 +386,7 @@
                     const resp = await fetch("/search", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ query: queryVal, exhaustive: state.exhaustive })
+                        body: JSON.stringify({ query: queryVal })
                     });
                     const r = await resp.json();
                     setState("displayLimit", 20);
@@ -399,14 +397,13 @@
             };
 
             const fetchGraphCommunities = async () => {
-                if (graphAbortController) {
-                    graphAbortController.abort();
-                }
+                if (graphAbortController) graphAbortController.abort();
                 graphAbortController = new AbortController();
                 setState("graphLoading", true);
                 try {
                     const queryParam = encodeURIComponent(state.q);
-                    const res = await fetch(`/graph-communities?target_partitions=${targetPartitionsInput?.value || 5}&sample_size=${sampleSizeInput?.value || 150}&query=${queryParam}`, { signal: graphAbortController.signal });
+                    const sampleSizeVal = sampleSizeInput?.value || 150;
+                    const res = await fetch(`/graph-communities?target_partitions=${targetPartitionsInput?.value || 5}&sample_size=${sampleSizeVal}&query=${queryParam}`, { signal: graphAbortController.signal });
                     const gRes = await res.json();
                     setState("graphData", gRes);
                     if (state.activeTab === 'search') {
@@ -414,9 +411,7 @@
                     }
                     fetchStats();
                 } catch (e) {
-                    if (e.name !== 'AbortError') {
-                        log("SEARCH", "Error fetching Louvain graph partitions.");
-                    }
+                    if (e.name !== 'AbortError') log("SEARCH", "Error fetching Louvain graph partitions.");
                 } finally {
                     setState("graphLoading", false);
                 }
@@ -445,11 +440,11 @@
                 }
 
                 const width = graphContainer.clientWidth || 1000;
-                const height = state.isGraphFullscreen ? 700 : 540;
+                const height = state.isGraphFullscreen ? 700 : 450;
                 const canvas = document.createElement("canvas");
                 canvas.width = width * window.devicePixelRatio;
                 canvas.height = height * window.devicePixelRatio;
-                canvas.style.cssText = state.isGraphFullscreen ? "width:100%;height:100%;object-fit:contain;" : "width:100%;height:auto;min-height:540px;max-height:540px;object-fit:contain;";
+                canvas.style.cssText = state.isGraphFullscreen ? "width:100%;height:100%;object-fit:contain;" : "width:100%;height:100%;object-fit:contain;";
                 graphContainer.appendChild(canvas);
 
                 const ctx = canvas.getContext("2d");
@@ -548,383 +543,291 @@
                 if (tab === 'search') {
                     requestAnimationFrame(() => {
                         setTimeout(() => {
-                            if (graphContainer) {
-                                renderCanvasGraph(state.graphData);
-                            }
+                            if (graphContainer) renderCanvasGraph(state.graphData);
                         }, 60);
                     });
                 }
             };
 
-            return h("div", {class: "max-w-7xl w-full mx-auto p-3 md:p-5 space-y-3 flex flex-col"},
-                h("header", {class: "flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-200 pb-2.5 shrink-0 relative z-50"},
-                    h("div", {class: "flex items-center gap-4 flex-wrap"},
-                        h("div", {class: "relative inline-block"},
+            return h("div", {class: "max-w-7xl w-full h-full mx-auto p-2 md:p-3 flex flex-col overflow-hidden"},
+                h("header", {class: "flex flex-col md:flex-row md:items-center justify-between gap-2 border-b border-slate-200 pb-2 shrink-0 relative z-50 pt-2"},
+                    h("div", {class: "flex items-center gap-3 flex-wrap"},
+                        h("div", {class: "relative inline-block pt-2"},
                             h("h1", {
                                 onMouseEnter: () => setShowProgressTooltip(true),
                                 onMouseLeave: () => setShowProgressTooltip(false),
-                                class: "text-xl font-semibold tracking-tight text-slate-900 cursor-pointer underline decoration-dotted decoration-slate-400"
+                                class: "text-lg font-semibold tracking-tight text-slate-900 cursor-pointer underline decoration-dotted decoration-slate-400"
                             }, "Public Documents"),
-                            () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-2 w-72 bg-slate-900 text-white p-3 rounded-lg shadow-2xl z-[9999] font-mono text-xs space-y-1.5 border border-slate-700"}, [
+                            () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-1.5 w-64 bg-slate-900 text-white p-2.5 rounded shadow-xl z-[9999] font-mono text-[11px] space-y-1 border border-slate-700"}, [
                                 h("div", {class: "text-emerald-400 font-bold border-b border-slate-700 pb-1 mb-1"}, "Pipeline Progress Overview"),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".gov Crawled:"), h("span", {}, `${state.progress.gov_crawled || 0} / ${state.progress.total_gov || 0}`)]),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".edu Crawled:"), h("span", {}, `${state.progress.edu_crawled || 0} / ${state.progress.total_edu || 0}`)]),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".mil Crawled:"), h("span", {}, `${state.progress.mil_crawled || 0} / ${state.progress.total_mil || 0}`)]),
-                                h("div", {class: "flex justify-between"}, [h("span", {}, "Wiki Articles:"), h("span", {}, `${state.progress.wiki_crawled || state.wikiTotal || 0} / ${state.progress.total_wiki || state.wikiTotalCount || 6800000}`)]),
+                                h("div", {class: "flex justify-between"}, [h("span", {}, "Wiki Articles:"), h("span", {}, `${state.progress.wiki_crawled || state.wikiTotal || 0} / 6800000`)]),
+                                h("div", {class: "flex justify-between text-amber-400"}, [h("span", {}, "Total Embeddings:"), h("span", {}, `${state.totalEmbeddings || 0}`)]),
+                                h("div", {class: "flex justify-between text-amber-300"}, [h("span", {}, "Pending Embeddings:"), h("span", {}, `${state.pendingEmbeddings || 0}`)]),
                                 h("div", {class: "border-t border-slate-700 pt-1 mt-1 flex justify-between text-slate-300"}, [h("span", {}, "PDFs Discovered:"), h("span", {}, `${state.progress.pdfs_discovered || 0}`)]),
                                 h("div", {class: "flex justify-between text-slate-300"}, [h("span", {}, "Total Visited:"), h("span", {}, `${state.progress.visited || 0}`)])
                             ])
                         ),
-                        h("div", {class: "flex items-center gap-2 font-mono text-xs"},
+                        h("div", {class: "flex items-center gap-1.5 font-mono text-xs pt-2"},
                             h("div", {class: "relative group flex items-center"},
                                 h("button", {
                                     onClick: async () => { const r = await (await fetch("/crawler/toggle", {method: "POST"})).json(); setState("isPaused", r.paused); },
-                                    class: () => `p-2 rounded-lg text-white font-bold transition flex items-center justify-center shadow-xs ${state.isPaused ? 'bg-red-600 hover:bg-emerald-600' : 'bg-emerald-600 hover:bg-emerald-700'}`
+                                    class: () => `p-1.5 rounded text-white font-bold transition flex items-center justify-center shadow-xs ${state.isPaused ? 'bg-red-600 hover:bg-emerald-600' : 'bg-emerald-600 hover:bg-emerald-700'}`
                                 }, () => state.isPaused ? 
-                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z"})) : 
-                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M8 5v14l11-7z"}))
+                                    h("svg", {class: "w-3.5 h-3.5 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z"})) : 
+                                    h("svg", {class: "w-3.5 h-3.5 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M8 5v14l11-7z"}))
                                 ),
                                 h("span", {class: "absolute left-1/2 -translate-x-1/2 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, () => state.isPaused ? "Click to Resume Crawler" : "Click to Pause Crawler")
-                            ),
-                            h("div", {class: "relative group flex items-center"},
-                                h("button", {
-                                    onClick: generateEmbeddings,
-                                    class: () => `p-2 rounded-lg text-white font-bold transition flex items-center justify-center shadow-xs ${state.isEmbActive ? 'bg-amber-600 hover:bg-red-600' : 'bg-red-600 hover:bg-emerald-600'}`
-                                }, () => state.isEmbActive ?
-                                    h("svg", {class: "w-4 h-4 fill-current animate-pulse", viewBox: "0 0 24 24"}, h("path", {d: "M8 5v14l11-7z"})) :
-                                    h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z"}))
-                                ),
-                                h("span", {class: "absolute left-1/2 -translate-x-1/2 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, () => state.isEmbActive ? "Click to Cancel Embeddings" : "Click to Start Embeddings Generator")
                             )
-                        )
-                    ),
-                    h("div", {class: "flex items-center gap-3"},
-                        h("div", {class: "relative group flex items-center"},
-                            h("a", {
-                                href: "http://localhost:3000",
-                                target: "_blank",
-                                rel: "noopener noreferrer",
-                                class: "p-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg transition flex items-center justify-center shadow-xs"
-                            },
-                                h("svg", {class: "w-4 h-4 fill-current", viewBox: "0 0 24 24"}, h("path", {d: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"}))
-                            ),
-                            h("span", {class: "absolute right-0 top-full mt-1 hidden group-hover:block bg-slate-900 text-white text-[10px] px-2 py-0.5 rounded shadow-lg whitespace-nowrap z-[9999]"}, "Open S4 Tenant UI")
                         )
                     )
                 ),
-                h("main", {class: "space-y-3 flex flex-col w-full pb-12"},
-                    h("div", {class: "bg-white p-3 md:p-4 rounded-lg border border-slate-200/80 shadow-xs space-y-2.5 flex flex-col w-full"},
-                        h("div", {class: "flex items-center gap-1 border-b border-slate-200 pb-1.5 shrink-0 z-30 relative flex-wrap"},
+                h("main", {class: "flex-1 flex flex-col w-full overflow-hidden pt-2 pb-2"},
+                    h("div", {class: "bg-white p-2.5 md:p-3 rounded border border-slate-200/80 shadow-xs flex-1 flex flex-col w-full overflow-hidden"},
+                        h("div", {class: "flex items-center gap-1 border-b border-slate-200 pb-1 shrink-0 z-30 relative flex-wrap"},
                             h("button", {
                                 onClick: () => switchTab('map'),
-                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'map' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                                class: () => `px-3 py-1 rounded-t text-xs font-semibold transition border-t border-x cursor-pointer ${state.activeTab === 'map' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
                             }, "US Map"),
                             h("button", {
                                 onClick: () => switchTab('search'),
-                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer flex items-center gap-1.5 ${state.activeTab === 'search' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                                class: () => `px-3 py-1 rounded-t text-xs font-semibold transition border-t border-x cursor-pointer flex items-center gap-1.5 ${state.activeTab === 'search' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
                             }, [
                                 "Search",
                                 h("span", {class: () => `px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${state.activeTab === 'search' ? 'bg-emerald-700 text-white' : 'bg-slate-200 text-slate-700'}`}, () => state.totalEmbeddings)
                             ]),
                             h("button", {
-                                onClick: () => switchTab('growth'),
-                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'growth' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
-                            }, "Growth & Nutrition"),
-                            h("button", {
-                                onClick: () => switchTab('flamegraph'),
-                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'flamegraph' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
-                            }, "Flame Graph"),
-                            h("button", {
-                                onClick: () => switchTab('audit'),
-                                class: () => `px-4 py-1.5 rounded-t-lg text-xs font-bold transition border-t border-x cursor-pointer ${state.activeTab === 'audit' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
-                            }, "Compliance & PDF")
+                                onClick: () => switchTab('catalog'),
+                                class: () => `px-3 py-1 rounded-t text-xs font-semibold transition border-t border-x cursor-pointer flex items-center gap-1.5 ${state.activeTab === 'catalog' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'}`
+                            }, [
+                                "Catalog Explorer",
+                                h("span", {class: () => `px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${state.activeTab === 'catalog' ? 'bg-emerald-700 text-white' : 'bg-slate-200 text-slate-700'}`}, () => state.catalogTotalCount || state.catalogItems.length)
+                            ])
                         ),
 
                         /* US Map Tab Panel */
-                        h("div", {style: () => state.activeTab === 'map' ? "display: flex; flex-direction: column; gap: 10px;" : "display: none;"}, [
-                            h("div", {class: "w-full bg-slate-50 rounded border border-slate-200/60 p-1 flex items-center justify-center relative min-h-[540px] max-h-[540px]"}, [
-                                () => mapLoading() && h("div", {class: "absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 z-30 space-y-2"}, [
-                                    h("div", {class: "w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
+                        h("div", {style: () => state.activeTab === 'map' ? "display: flex; flex-direction: column; flex: 1; overflow: hidden; padding-top: 4px;" : "display: none;"}, [
+                            h("div", {class: "flex-1 w-full bg-slate-50 rounded border border-slate-200/60 p-1 flex items-center justify-center relative overflow-hidden min-h-0"}, [
+                                () => mapLoading() && h("div", {class: "absolute inset-0 flex flex-col items-center justify-center bg-slate-50/90 z-30 space-y-1.5"}, [
+                                    h("div", {class: "w-5 h-5 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
                                     h("span", {class: "text-xs font-medium text-slate-500"}, "Loading Map...")
                                 ]),
                                 h("div", {ref: el => { mapContainer = el; }, class: "w-full h-full flex items-center justify-center"})
-                            ]),
-                            h("div", {class: "bg-slate-100 rounded-lg p-2 font-mono text-[11px] border border-slate-200 space-y-1 shrink-0"}, [
-                                h("div", {class: "text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1"}, "Live Stream Logs"),
-                                h("div", {class: "space-y-1"}, logs().slice(0, 4).map(l => h("div", {class: "flex items-start gap-2 text-slate-700 border-b border-slate-200/60 pb-0.5"}, [
-                                    h("span", {class: "text-slate-400 shrink-0"}, `[${l.time}]`),
-                                    h("span", {class: "px-1 py-0.2 rounded text-[9px] font-bold uppercase bg-emerald-100 text-emerald-800 shrink-0"}, l.type),
-                                    h("span", {class: "break-all text-slate-800"}, l.message)
-                                ])))
                             ])
                         ]),
 
                         /* Search Tab Panel */
-                        h("div", {style: () => state.activeTab === 'search' ? "display: flex; flex-direction: column; gap: 12px; width: 100%;" : "display: none;"}, [
-                            h("div", {class: "sticky top-0 z-40 bg-white pt-1 pb-2 space-y-3 shadow-xs"}, [
-                                h("div", {class: "flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-2.5 rounded border border-slate-200 text-xs shrink-0 max-w-full"}, [
-                                    h("form", {onSubmit: handleSearchSubmit, class: "flex-1 flex gap-2 min-w-[280px] max-w-full"}, [
+                        h("div", {style: () => state.activeTab === 'search' ? "display: flex; flex-direction: column; flex: 1; gap: 8px; width: 100%; overflow: hidden; padding-top: 4px;" : "display: none;"}, [
+                            h("div", {class: "bg-white w-full shrink-0 max-w-full shadow-xs relative rounded border border-slate-200/60 overflow-hidden"}, [
+                                h("div", {class: "absolute top-2.5 left-2.5 right-2.5 z-40 flex flex-wrap items-center justify-between gap-1.5 bg-transparent p-1 rounded text-xs pointer-events-auto"}, [
+                                    h("form", {onSubmit: handleSearchSubmit, class: "flex-1 flex gap-1.5 min-w-[220px] max-w-full items-center"}, [
                                         h("input", {
                                             value: () => state.q,
                                             onInput: e => setState("q", e.target.value),
                                             placeholder: "Search semantic vector space & partition clusters...",
-                                            class: "w-full px-3 py-1.5 border border-slate-200 rounded font-mono text-xs bg-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                                            class: "w-full px-2.5 py-1 border border-slate-300 rounded font-mono text-xs bg-white/95 backdrop-blur-xs shadow-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                                         }),
-                                        h("button", {type: "submit", class: "px-4 py-1.5 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded transition shrink-0"}, () => searchResultResource.loading ? "Searching..." : "Search"),
-                                        () => state.graphLoading && h("button", {type: "button", onClick: cancelSearch, class: "px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white font-medium rounded transition shrink-0 text-xs"}, "Cancel")
+                                        h("button", {type: "submit", class: "px-2.5 py-1 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded transition shrink-0 shadow-xs"}, () => searchResultResource.loading ? "Searching..." : "Search"),
+                                        () => state.graphLoading && h("button", {type: "button", onClick: cancelSearch, class: "px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white font-medium rounded transition shrink-0 text-xs shadow-xs"}, "Cancel")
                                     ]),
-                                    h("div", {class: "flex flex-wrap items-center gap-2 font-mono text-[11px]"}, [
-                                        h("div", {class: "flex items-center gap-1.5"}, [
+                                    h("div", {class: "flex flex-wrap items-center gap-1 font-mono text-[10px] bg-white/90 backdrop-blur-xs px-2 py-0.5 rounded shadow-xs border border-slate-200"}, [
+                                        h("div", {class: "flex items-center gap-1"}, [
                                             h("span", {}, "Partitions:"),
-                                            h("input", {ref: el => { targetPartitionsInput = el; }, type: "number", value: "5", min: "1", max: "20", class: "w-12 px-1 py-1 border rounded text-center bg-white"})
+                                            h("input", {ref: el => { targetPartitionsInput = el; }, type: "number", value: "5", min: "1", max: "20", class: "w-8 px-0.5 py-0.2 border rounded text-center bg-white"})
                                         ]),
-                                        h("div", {class: "flex items-center gap-1 bg-white border border-slate-200 px-2 py-1 rounded"}, [
-                                            h("label", {class: "flex items-center gap-1 cursor-pointer text-slate-700 font-medium"}, [
-                                                h("input", {type: "checkbox", checked: state.exhaustive, onChange: e => setState("exhaustive", e.target.checked), class: "rounded border-slate-300 text-emerald-600"}), "Exhaustive"
-                                            ])
+                                        h("div", {class: "flex items-center gap-1"}, [
+                                            h("span", {}, "N ="),
+                                            h("input", {ref: el => { sampleSizeInput = el; }, type: "number", value: "150", min: "10", max: "500", class: "w-12 px-0.5 py-0.2 border rounded text-center bg-white"})
                                         ]),
-                                        h("select", {value: state.tldFilter, onChange: e => { setState("tldFilter", e.target.value); if (graphContainer) renderCanvasGraph(state.graphData); }, class: "px-1.5 py-1 border border-slate-200 rounded font-mono text-[11px] bg-white"},
-                                            ['all', 'gov', 'edu', 'mil', 'wiki'].map(v => h("option", {value: v}, v === 'all' ? 'All Sources' : `.${v}`))
-                                        )
+                                        h("select", {value: state.tldFilter, onChange: e => { setState("tldFilter", e.target.value); if (graphContainer) renderCanvasGraph(state.graphData); }, class: "px-1.5 py-0.2 border border-slate-200 rounded font-mono text-[10px] bg-white"},
+                                            ['gov', 'edu', 'mil', 'wiki'].map(v => h("option", {value: v}, `.${v}`))
+                                        ),
+                                        h("span", {class: "text-slate-300 mx-0.5"}, "|"),
+                                        h("button", {type: "button", onClick: () => setState("pinMode", !state.pinMode), class: () => `px-1.5 py-0.2 rounded font-medium text-[10px] ${state.pinMode ? 'bg-amber-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}, () => state.pinMode ? `Pinned (${state.pinnedNodes.length})` : "Pin Mode"),
+                                        h("button", {type: "button", onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 1.3), class: "px-1.5 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[10px]"}, "+"),
+                                        h("button", {type: "button", onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 0.7), class: "px-1.5 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[10px]"}, "-"),
+                                        h("button", {type: "button", onClick: () => { setState("pinnedNodes", []); zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.transform, d3.zoomIdentity); }, class: "px-1 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[9px]"}, "Reset"),
+                                        h("button", {type: "button", onClick: () => setState("isGraphFullscreen", !state.isGraphFullscreen), class: "px-1.5 py-0.2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-bold text-[9px]"}, () => state.isGraphFullscreen ? "Exit" : "Maximize")
                                     ])
                                 ]),
-                                
-                                h("div", {ref: el => { graphWrapperRef = el; }, class: () => state.isGraphFullscreen ? "fixed inset-0 z-50 bg-slate-900/95 p-6 flex flex-col justify-center items-center max-w-full" : "bg-white w-full shrink-0 max-w-full shadow-sm pb-1.5 relative"}, [
-                                    h("div", {class: "absolute top-2 right-2 z-30 flex items-center gap-1 bg-white/90 p-1 rounded shadow border border-slate-200"}, [
-                                        h("button", {onClick: () => setState("pinMode", !state.pinMode), class: () => `px-2.5 py-0.5 rounded font-medium text-xs ${state.pinMode ? 'bg-amber-600 text-white' : 'bg-white border text-slate-700'}`}, () => state.pinMode ? `Pinned (${state.pinnedNodes.length})` : "Pin Mode"),
-                                        h("span", {class: "text-slate-300 mx-0.5"}, "|"),
-                                        h("button", {onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 1.3), class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 font-bold text-xs"}, "+"),
-                                        h("button", {onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 0.7), class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 font-bold text-xs"}, "-"),
-                                        h("button", {onClick: () => { setState("pinnedNodes", []); zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.transform, d3.zoomIdentity); }, class: "px-2 py-0.5 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 text-[10px]"}, "Reset"),
-                                        h("button", {onClick: () => setState("isGraphFullscreen", !state.isGraphFullscreen), class: "px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-bold text-[10px]"}, () => state.isGraphFullscreen ? "Exit Fullscreen" : "Maximize")
-                                    ]),
-                                    h("div", {ref: el => { graphContainer = el; }, class: () => state.isGraphFullscreen ? "w-full max-w-6xl h-[80vh] bg-white rounded shadow-xl p-2 relative flex items-center justify-center overflow-hidden" : "w-full bg-slate-50 rounded border border-slate-200/60 p-1 min-h-[540px] max-h-[540px] flex items-center justify-center overflow-hidden relative"}, [
-                                        () => state.graphLoading && h("div", {class: "absolute inset-0 bg-slate-50/80 backdrop-blur-xs flex flex-col items-center justify-center z-30 space-y-2"}, [
-                                            h("div", {class: "w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
-                                            h("span", {class: "text-xs font-mono text-slate-600 font-semibold"}, "Computing Louvain Partitions & Embeddings...")
-                                        ])
-                                    ]),
-                                    () => hoveredNode() && h("div", {style: `left: ${Math.min(Math.max(10, hoverPos().x - 120), 750)}px; top: ${Math.max(10, hoverPos().y - 90)}px;`, class: "absolute z-50 bg-slate-900/95 text-white p-2.5 rounded-lg shadow-xl font-mono text-[11px] max-w-xs pointer-events-none space-y-1 border border-slate-700"}, [
-                                        h("div", {class: "flex justify-between text-emerald-300 border-b border-slate-700 pb-1"}, [
-                                            h("span", {}, `Node #${hoveredNode().id}`),
-                                            h("span", {}, `${hoveredNode().text_length} chars`)
-                                        ]),
-                                        h("p", {class: "italic text-slate-200 line-clamp-3"}, `"${hoveredNode().full_text}"`)
+
+                                h("div", {ref: el => { graphContainer = el; }, class: () => state.isGraphFullscreen ? "w-full max-w-6xl h-[80vh] bg-white rounded shadow-xl p-2 relative flex items-center justify-center overflow-hidden" : "w-full bg-slate-50 p-1 h-[280px] flex items-center justify-center overflow-hidden relative"}, [
+                                    () => state.graphLoading && h("div", {class: "absolute inset-0 bg-slate-50/80 backdrop-blur-xs flex flex-col items-center justify-center z-30 space-y-1.5"}, [
+                                        h("div", {class: "w-5 h-5 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"}),
+                                        h("span", {class: "text-xs font-mono text-slate-600 font-semibold"}, "Computing Louvain Partitions & Embeddings...")
                                     ])
+                                ]),
+                                () => hoveredNode() && h("div", {style: `left: ${Math.min(Math.max(10, hoverPos().x - 120), 750)}px; top: ${Math.max(10, hoverPos().y - 90)}px;`, class: "absolute z-50 bg-slate-900/95 text-white p-2 rounded shadow-lg font-mono text-[10px] max-w-xs pointer-events-none space-y-1 border border-slate-700"}, [
+                                    h("div", {class: "flex justify-between text-emerald-300 border-b border-slate-700 pb-0.5"}, [
+                                        h("span", {}, `Node #${hoveredNode().id}`),
+                                        h("span", {}, `${hoveredNode().text_length} chars`)
+                                    ]),
+                                    h("p", {class: "italic text-slate-200 line-clamp-3"}, `"${hoveredNode().full_text}"`)
                                 ])
                             ]),
                             
-                            h("div", {class: "space-y-2.5 pt-3 w-full"}, [
-                                h("div", {class: "sticky top-[640px] z-20 bg-white py-2 border-b border-slate-200 flex justify-between items-center shrink-0 max-w-full shadow-md"}, [
-                                    h("div", {class: "flex items-center gap-2"}, [
-                                        h("button", {onClick: () => setState("bottomPaneTab", 'results'), class: () => `text-xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded transition flex items-center gap-2 ${state.bottomPaneTab === 'results' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
+                            h("div", {class: "flex flex-col flex-1 border border-slate-200 rounded bg-white shadow-xs w-full overflow-hidden min-h-0"}, [
+                                h("div", {class: "sticky top-0 z-30 bg-white px-3 py-2 border-b border-slate-200 flex justify-between items-center shrink-0 shadow-xs"}, [
+                                    h("div", {class: "flex items-center gap-1.5"}, [
+                                        h("button", {onClick: () => setState("bottomPaneTab", 'results'), class: () => `text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded transition flex items-center gap-1.5 ${state.bottomPaneTab === 'results' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
                                             "Search Matches",
-                                            h("span", {class: "bg-slate-200 text-slate-800 px-1.5 py-0.2 rounded-full text-[10px] font-bold"}, () => searchResultResource()?.length || 0)
+                                            h("span", {class: "bg-slate-200 text-slate-800 px-1 py-0.2 rounded-full text-[9px] font-bold"}, () => searchResultResource()?.length || 0)
                                         ]),
-                                        h("button", {onClick: () => setState("bottomPaneTab", 'pinned'), class: () => `text-xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded transition flex items-center gap-2 ${state.bottomPaneTab === 'pinned' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
+                                        h("button", {onClick: () => setState("bottomPaneTab", 'pinned'), class: () => `text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded transition flex items-center gap-1.5 ${state.bottomPaneTab === 'pinned' ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}, [
                                             "Pinned Nodes",
-                                            h("span", {class: "bg-slate-200 text-slate-800 px-1.5 py-0.2 rounded-full text-[10px] font-bold"}, () => state.pinnedNodes.length)
+                                            h("span", {class: "bg-slate-200 text-slate-800 px-1 py-0.2 rounded-full text-[9px] font-bold"}, () => state.pinnedNodes.length)
                                         ])
                                     ]),
-                                    h("div", {class: "flex items-center gap-3 font-mono text-[11px] text-slate-600 bg-slate-50 px-2.5 py-1 rounded border border-slate-200"}, [
+                                    h("div", {class: "flex items-center gap-2 font-mono text-[10px] text-slate-600 bg-slate-50 px-2 py-0.5 rounded border border-slate-200"}, [
                                         h("span", {}, () => `Modularity: ${state.graphData.modularity ?? 0.0}`),
                                         h("span", {class: "text-slate-300"}, "|"),
                                         h("span", {}, () => `Clustering: ${state.graphData.clustering_coefficient ?? 0.0}`)
                                     ])
                                 ]),
-                                h(Suspense, {
-                                    get children() {
-                                        return h("div", {class: "space-y-3 w-full relative z-0"}, [
-                                            state.bottomPaneTab === 'results' ? (
-                                                !searchResultResource() || searchResultResource().length === 0 ? h("p", {class: "text-slate-400 italic text-center py-6 text-xs"}, searchResultResource.loading ? "Searching vector space..." : "Enter a query above to retrieve semantically matching items.") :
-                                                h("div", {class: "space-y-3 w-full"}, [
-                                                    searchResultResource().slice(0, state.displayLimit).map(r => h("article", {class: "bg-white p-3.5 rounded-lg border border-slate-200 shadow-2xs space-y-1.5 font-mono w-full box-border overflow-hidden"}, [
-                                                        h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
-                                                            h("div", {class: "flex items-center gap-3 max-w-full truncate"}, [
-                                                                h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${r.score}`),
-                                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans truncate"}, r.domain)
+                                h("div", {class: "p-3 space-y-2.5 overflow-y-auto flex-1"}, [
+                                    h(Suspense, {
+                                        get children() {
+                                            return h("div", {class: "space-y-2.5 w-full relative z-0"}, [
+                                                state.bottomPaneTab === 'results' ? (
+                                                    !searchResultResource() || searchResultResource().length === 0 ? h("p", {class: "text-slate-400 italic text-center py-5 text-xs"}, searchResultResource.loading ? "Searching vector space..." : "Enter a query above to retrieve semantically matching items.") :
+                                                    h("div", {class: "space-y-2.5 w-full"}, [
+                                                        searchResultResource().slice(0, state.displayLimit).map(r => h("article", {class: "bg-white p-3 rounded border border-slate-200 shadow-2xs space-y-1 font-mono w-full box-border overflow-hidden"}, [
+                                                            h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
+                                                                h("div", {class: "flex items-center gap-2.5 max-w-full truncate"}, [
+                                                                    h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${r.score}`),
+                                                                    h("h3", {class: "text-xs font-semibold text-slate-900 font-sans truncate"}, r.domain)
+                                                                ]),
+                                                                h("span", {class: "text-[11px] text-slate-500 shrink-0"}, `${r.county}, ${r.state}`)
                                                             ]),
-                                                            h("span", {class: "text-xs text-slate-500 shrink-0"}, `${r.county}, ${r.state}`)
-                                                        ]),
-                                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded italic break-all whitespace-normal max-w-full"}, `"${r.chunk}"`),
-                                                        r.pdf_url && h("a", {href: r.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, r.pdf_url)
-                                                    ])),
-                                                    state.displayLimit < searchResultResource().length && h("div", {class: "flex justify-center pt-2 pb-4"}, [
-                                                        h("button", {onClick: () => setState("displayLimit", state.displayLimit + 20), class: "px-4 py-2 bg-slate-900 text-white text-xs font-semibold rounded hover:bg-slate-800 transition"}, "Load More Results (+20)")
+                                                            h("p", {class: "text-xs text-slate-700 bg-slate-50 p-1.5 rounded italic break-all whitespace-normal max-w-full"}, `"${r.chunk}"`),
+                                                            r.pdf_url && h("a", {href: r.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, r.pdf_url)
+                                                        ])),
+                                                        state.displayLimit < searchResultResource().length && h("div", {class: "flex justify-center pt-1.5 pb-3"}, [
+                                                            h("button", {onClick: () => setState("displayLimit", state.displayLimit + 20), class: "px-3 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded hover:bg-slate-800 transition"}, "Load More Results (+20)")
+                                                        ])
                                                     ])
-                                                ])
-                                            ) : (
-                                                !state.pinnedNodes.length ? h("p", {class: "text-slate-400 italic text-center py-6 text-xs"}, "No nodes pinned. Click nodes on the graph while pinning mode is active.") :
-                                                h("div", {class: "space-y-2 w-full"}, [
-                                                    state.pinnedNodes.map(p => h("article", {class: "bg-white p-3.5 rounded-lg border border-slate-200 shadow-2xs space-y-1.5 font-mono w-full box-border overflow-hidden"}, [
-                                                        h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
-                                                            h("div", {class: "flex items-center gap-3 max-w-full truncate"}, [
-                                                                h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${p.relevance !== undefined ? p.relevance.toFixed(3) : '1.000'}`),
-                                                                h("h3", {class: "text-sm font-semibold text-slate-900 font-sans truncate"}, p.pdf_url ? new URL(p.pdf_url).hostname : "Pinned Node")
+                                                ) : (
+                                                    !state.pinnedNodes.length ? h("p", {class: "text-slate-400 italic text-center py-5 text-xs"}, "No nodes pinned. Click nodes on the graph while pinning mode is active.") :
+                                                    h("div", {class: "space-y-2 w-full"}, [
+                                                        state.pinnedNodes.map(p => h("article", {class: "bg-white p-3 rounded border border-slate-200 shadow-2xs space-y-1 font-mono w-full box-border overflow-hidden"}, [
+                                                            h("div", {class: "flex flex-wrap justify-between items-center gap-2 max-w-full"}, [
+                                                                h("div", {class: "flex items-center gap-2.5 max-w-full truncate"}, [
+                                                                    h("span", {class: "text-emerald-600 font-semibold text-xs shrink-0"}, `Score: ${p.relevance !== undefined ? p.relevance.toFixed(3) : '1.000'}`),
+                                                                    h("h3", {class: "text-xs font-semibold text-slate-900 font-sans truncate"}, p.pdf_url ? new URL(p.pdf_url).hostname : "Pinned Node")
+                                                                ]),
+                                                                h("div", {class: "flex items-center gap-1.5 shrink-0"}, [
+                                                                    h("span", {class: "text-[11px] text-slate-500"}, `${p.county || 'National'}, ${p.state || 'US'}`),
+                                                                    h("button", {onClick: () => setState("pinnedNodes", state.pinnedNodes.filter(n => n.id !== p.id)), class: "text-slate-400 hover:text-red-600 font-bold ml-1"}, "×")
+                                                                ])
                                                             ]),
-                                                            h("div", {class: "flex items-center gap-2 shrink-0"}, [
-                                                                h("span", {class: "text-xs text-slate-500"}, `${p.county || 'National'}, ${p.state || 'US'}`),
-                                                                h("button", {onClick: () => setState("pinnedNodes", state.pinnedNodes.filter(n => n.id !== p.id)), class: "text-slate-400 hover:text-red-600 font-bold ml-2"}, "×")
-                                                            ])
-                                                        ]),
-                                                        h("p", {class: "text-xs text-slate-700 bg-slate-50 p-2 rounded italic break-all whitespace-normal max-w-full"}, `"${p.full_text}"`),
-                                                        p.pdf_url && h("a", {href: p.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, p.pdf_url)
-                                                    ]))
-                                                ])
-                                            )
-                                        ]);
-                                    }
-                                })
-                            ])
-                        ]),
-
-                        /* Growth & Nutrition Tab Panel */
-                        h("div", {style: () => state.activeTab === 'growth' ? "display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: 1.5rem;" : "display: none;", class: "lg:grid-cols-3"}, [
-                            h("div", {class: "grid grid-cols-1 lg:grid-cols-3 gap-6 w-full"}, [
-                                h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-5 text-slate-100"}, [
-                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Simulation Parameters"),
-                                    h("div", {}, [
-                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, ["Target Mass (kg): ", h("span", {class: "text-emerald-400 font-mono"}, () => state.mass)]),
-                                        h("input", {
-                                            type: "range", min: "10", max: "120", value: () => state.mass,
-                                            onInput: e => setState("mass", e.target.value),
-                                            class: "w-full accent-emerald-500 bg-slate-800 rounded-lg cursor-pointer"
-                                        })
-                                    ]),
-                                    h("div", {}, [
-                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Duration (Days)"),
-                                        h("input", {
-                                            type: "number", min: "1", max: "365", value: () => state.days,
-                                            onInput: e => setState("days", e.target.value),
-                                            class: "w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500 font-mono"
-                                        })
-                                    ]),
-                                    h("div", {}, [
-                                        h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Phenotype Gender"),
-                                        h("select", {
-                                            value: () => state.gender,
-                                            onChange: e => setState("gender", e.target.value),
-                                            class: "w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
-                                        }, [
-                                            h("option", {value: "m"}, "Male (m)"),
-                                            h("option", {value: "f"}, "Female (f)")
-                                        ])
-                                    ]),
-                                    h("button", {
-                                        onClick: runGrowthSimulation,
-                                        disabled: () => state.loadingGrowth,
-                                        class: "w-full bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold py-2.5 rounded-lg transition-all shadow-md disabled:opacity-50 text-sm cursor-pointer"
-                                    }, () => state.loadingGrowth ? 'Computing Stoichiometry...' : 'Run Simulation'),
-                                    () => state.growthError && h("div", {class: "bg-red-950/50 border border-red-800 text-red-300 p-3 rounded-lg text-xs"}, state.growthError)
-                                ]),
-                                h("div", {class: "lg:col-span-2 space-y-6"}, [
-                                    h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl text-slate-100"}, [
-                                        h("h2", {class: "text-lg font-semibold text-slate-200 mb-3"}, "Aggregated Dietary Portfolio"),
-                                        h("div", {class: "overflow-x-auto max-h-64 overflow-y-auto"}, [
-                                            h("table", {class: "w-full text-left border-collapse text-sm"}, [
-                                                h("thead", {}, h("tr", {class: "border-b border-slate-800 text-slate-400 text-xs"}, [
-                                                    h("th", {class: "py-2.5 px-3"}, "Food Item"),
-                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Mass (g)")
-                                                ])),
-                                                h("tbody", {class: "divide-y divide-slate-800/50 text-slate-300"}, [
-                                                    !(state.growthReport?.meal?.length) ? h("tr", {}, h("td", {colSpan: 2, class: "py-4 text-center text-slate-500 text-xs"}, "No active meal portfolio generated.")) :
-                                                    state.growthReport.meal.map(item => h("tr", {}, [
-                                                        h("td", {class: "py-2.5 px-3"}, item.desc),
-                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, item.grams)
-                                                    ]))
-                                                ])
-                                            ])
-                                        ])
-                                    ]),
-                                    h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl text-slate-100"}, [
-                                        h("h2", {class: "text-lg font-semibold text-slate-200 mb-3"}, "Organ Tissue Synthesis & Protein Allocation"),
-                                        h("div", {class: "overflow-x-auto max-h-64 overflow-y-auto"}, [
-                                            h("table", {class: "w-full text-left border-collapse text-sm"}, [
-                                                h("thead", {}, h("tr", {class: "border-b border-slate-800 text-slate-400 text-xs"}, [
-                                                    h("th", {class: "py-2.5 px-3"}, "Organ Name"),
-                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Organ Mass (kg)"),
-                                                    h("th", {class: "py-2.5 px-3 text-right"}, "Protein (g)")
-                                                ])),
-                                                h("tbody", {class: "divide-y divide-slate-800/50 text-slate-300"}, [
-                                                    !(state.growthReport?.organs?.length) ? h("tr", {}, h("td", {colSpan: 3, class: "py-4 text-center text-slate-500 text-xs"}, "Awaiting simulation execution.")) :
-                                                    state.growthReport.organs.map(org => h("tr", {}, [
-                                                        h("td", {class: "py-2.5 px-3 capitalize"}, org.name),
-                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, org.mass_kg.toFixed(2)),
-                                                        h("td", {class: "py-2.5 px-3 text-right font-mono"}, org.protein_g.toFixed(2))
-                                                    ]))
-                                                ])
-                                            ])
-                                        ])
-                                    ])
+                                                            h("p", {class: "text-xs text-slate-700 bg-slate-50 p-1.5 rounded italic break-all whitespace-normal max-w-full"}, `"${p.full_text}"`),
+                                                            p.pdf_url && h("a", {href: p.pdf_url, target: "_blank", class: "text-emerald-600 hover:underline text-[10px] font-semibold block truncate max-w-full"}, p.pdf_url)
+                                                        ]))
+                                                    ])
+                                                )
+                                            ]);
+                                        }
+                                    })
                                 ])
                             ])
                         ]),
 
-                        /* Flame Graph Tab Panel */
-                        h("div", {style: () => state.activeTab === 'flamegraph' ? "display: block;" : "display: none;"}, [
-                            h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6 text-slate-100"}, [
-                                h("div", {class: "border-b border-slate-800 pb-4"}, [
-                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Systemic Biological Stack & Flame Graph"),
-                                    h("p", {class: "text-xs text-slate-400 mt-0.5"}, "Hierarchical aggregation of organ stoichiometry, metabolic cell turnover, and drug pathway interactions.")
-                                ]),
-                                h("div", {class: "bg-slate-950 border border-slate-800 rounded-xl p-6 space-y-4"}, [
-                                    h("div", {class: "space-y-2"}, [
-                                        h("div", {class: "flex justify-between text-xs font-mono text-slate-400"}, [
-                                            h("span", {}, "root: organism_simulation (100%)"),
-                                            h("span", {}, () => `${state.mass} kg`)
-                                        ]),
-                                        h("div", {class: "w-full bg-slate-900 h-8 rounded-lg overflow-hidden flex border border-slate-800"}, [
-                                            h("div", {style: "width: 40%;", class: "bg-emerald-600 hover:bg-emerald-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Skeletal Muscle (40%)"}, "Skeletal Muscle (40%)"),
-                                            h("div", {style: "width: 25%;", class: "bg-teal-600 hover:bg-teal-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Bone & Cartilage (25%)"}, "Bone (25%)"),
-                                            h("div", {style: "width: 20%;", class: "bg-cyan-600 hover:bg-cyan-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Viscera & Liver (20%)"}, "Viscera (20%)"),
-                                            h("div", {style: "width: 15%;", class: "bg-sky-600 hover:bg-sky-500 transition-all flex items-center justify-center text-xs font-semibold text-slate-950 font-mono cursor-pointer", title: "Neural & Skin (15%)"}, "Neural/Skin (15%)")
-                                        ])
+                        /* Catalog Explorer Tab Panel */
+                        h("div", {style: () => state.activeTab === 'catalog' ? "display: flex; flex-direction: column; flex: 1; gap: 10px; width: 100%; overflow: hidden; padding-top: 4px;" : "display: none;"}, [
+                            h("div", {class: "bg-white p-3 rounded border border-slate-200 shadow-xs flex flex-col flex-1 overflow-hidden space-y-3"}, [
+                                h("div", {class: "flex flex-col md:flex-row md:items-center justify-between gap-2.5 shrink-0"}, [
+                                    h("div", {}, [
+                                        h("h2", {class: "text-sm font-semibold text-slate-900"}, "Catalog URL & Scrape Explorer"),
+                                        h("p", {class: "text-[11px] text-slate-500 mt-0.5"}, "Manage records, trigger targeted domain scrapes, or review automated document and chunk embeddings.")
                                     ]),
-                                    h("div", {class: "p-4 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-300 space-y-2"}, [
-                                        h("div", {class: "text-emerald-400 font-bold"}, "Active Prolog Predicate Trace:"),
-                                        h("div", {}, "`simulate_growth(Age, skeletal_myocyte, AvailableNutrients, Output).` -> OK"),
-                                        h("div", {}, "`organ_needs(skeletal_muscle, m, 68, TotalNeeds).` -> Computed stoichiometric balance.")
+                                    h("div", {class: "flex flex-wrap items-center gap-2 w-full md:w-auto"}, [
+                                        h("input", {
+                                            value: () => state.catalogQuery,
+                                            onInput: e => setState("catalogQuery", e.target.value),
+                                            placeholder: "Filter domains...",
+                                            class: "w-full md:w-56 px-2.5 py-1.5 border border-slate-200 rounded font-mono text-xs bg-slate-50 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                                        })
                                     ])
-                                ])
-                            ])
-                        ]),
-
-                        /* Compliance & PDF Tab Panel */
-                        h("div", {style: () => state.activeTab === 'audit' ? "display: block;" : "display: none;"}, [
-                            h("div", {class: "bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6 text-slate-100"}, [
-                                h("div", {class: "border-b border-slate-800 pb-4"}, [
-                                    h("h2", {class: "text-lg font-semibold text-slate-200"}, "Local Gemma-2B Audit & PDF Report Generation"),
-                                    h("p", {class: "text-xs text-slate-400 mt-0.5"}, "Evaluate repositories against regulatory frameworks and export 1-page PDF diff reports.")
                                 ]),
-                                h("div", {class: "grid grid-cols-1 md:grid-cols-2 gap-6"}, [
-                                    h("div", {class: "space-y-4"}, [
-                                        h("div", {}, [
-                                            h("label", {class: "block text-xs font-medium text-slate-300 mb-1.5"}, "Repository Path"),
-                                            h("input", {
-                                                type: "text",
-                                                value: () => state.auditRepo,
-                                                onInput: e => setState("auditRepo", e.target.value),
-                                                class: "w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
-                                            })
+                                h("div", {class: "border border-slate-200 rounded overflow-y-auto flex-1"}, [
+                                    h("table", {class: "w-full text-left border-collapse text-xs font-mono"}, [
+                                        h("thead", {class: "bg-slate-100 text-slate-600 sticky top-0 z-10 border-b border-slate-200"}, [
+                                            h("tr", {}, [
+                                                h("th", {class: "py-2 px-2.5 w-8 text-center font-semibold"}, ""),
+                                                h("th", {class: "py-2 px-2.5 font-semibold"}, "Domain / URL"),
+                                                h("th", {class: "py-2 px-2.5 font-semibold"}, "Type"),
+                                                h("th", {class: "py-2 px-2.5 font-semibold"}, "Status"),
+                                                h("th", {class: "py-2 px-2.5 font-semibold text-right"}, "Chunks"),
+                                                h("th", {class: "py-2 px-2.5 font-semibold text-center"}, "Action")
+                                            ])
                                         ]),
+                                        h("tbody", {class: "divide-y divide-slate-100 text-slate-700"}, [
+                                            () => state.loadingCatalog && !state.catalogItems.length ? h("tr", {}, h("td", {colSpan: 6, class: "py-6 text-center text-slate-400 italic"}, "Loading catalog repository...")) :
+                                            filteredCatalogItems().length === 0 ? h("tr", {}, h("td", {colSpan: 6, class: "py-6 text-center text-slate-400 italic"}, "No matching URLs found.")) :
+                                            filteredCatalogItems().map(item => h("tr", {class: "hover:bg-slate-50/80 transition"}, [
+                                                h("td", {class: "py-2 px-2.5 text-center"}, [
+                                                    h("input", {
+                                                        type: "checkbox",
+                                                        checked: () => !!state.selectedDocIds[item.id],
+                                                        onChange: e => setState("selectedDocIds", item.id, e.target.checked),
+                                                        class: "rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
+                                                    })
+                                                ]),
+                                                h("td", {class: "py-2 px-2.5 max-w-xs truncate"}, [
+                                                    h("a", {href: item.url, target: "_blank", class: "text-emerald-600 hover:underline font-semibold block truncate"}, item.url),
+                                                    h("span", {class: "text-[10px] text-slate-400"}, `${item.county || 'National'}, ${item.state || 'US'}`)
+                                                ]),
+                                                h("td", {class: "py-2 px-2.5 uppercase text-[10px]"}, [
+                                                    h("span", {class: "px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded font-bold"}, item.tld_type || 'gov')
+                                                ]),
+                                                h("td", {class: "py-2 px-2.5"}, [
+                                                    h("span", {class: () => `px-1.5 py-0.5 rounded text-[10px] font-bold ${item.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' : (item.status === 'CRAWLING' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600')}`}, item.status || 'PENDING')
+                                                ]),
+                                                h("td", {class: "py-2 px-2.5 text-right font-semibold text-slate-900"}, item.chunks_count || 0),
+                                                h("td", {class: "py-2 px-2.5 text-center"}, [
+                                                    item.chunks_count > 0 ? 
+                                                    h("span", {class: "text-emerald-600 font-semibold text-[10px]"}, "Embedded") :
+                                                    h("button", {
+                                                        onClick: () => triggerScrapeAndEmbed(item.domain),
+                                                        disabled: () => state.actionStates[item.domain] === 'scraping',
+                                                        class: "px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-white rounded font-medium text-[10px] transition disabled:opacity-50 cursor-pointer"
+                                                    }, () => state.actionStates[item.domain] === 'scraping' ? "Processing..." : "Scrape & Embed Now")
+                                                ])
+                                            ]))
+                                        ])
+                                    ])
+                                ]),
+                                h("div", {class: "flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-100 shrink-0"}, [
+                                    h("div", {class: "flex items-center gap-2 font-mono text-xs text-slate-600"}, [
                                         h("button", {
-                                            onClick: runAudit,
-                                            disabled: () => state.loadingAudit,
-                                            class: "w-full bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold py-2.5 rounded-lg transition-all shadow-md text-sm disabled:opacity-50 cursor-pointer"
-                                        }, () => state.loadingAudit ? 'Running Gemma-2B Audit...' : 'Run Compliance Audit'),
+                                            onClick: () => fetchCatalog(Math.max(1, state.catalogPage - 1)),
+                                            disabled: () => state.catalogPage <= 1 || state.loadingCatalog,
+                                            class: "px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded disabled:opacity-40 cursor-pointer"
+                                        }, "Prev"),
+                                        h("span", {}, () => `Page ${state.catalogPage} of ${Math.ceil(state.catalogTotalCount / state.catalogPageSize) || 1}`),
                                         h("button", {
-                                            onClick: downloadDiffPdf,
-                                            class: "w-full bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 font-semibold py-2.5 rounded-lg transition-all shadow-md text-sm cursor-pointer"
-                                        }, "Download Diff PDF Report")
+                                            onClick: () => fetchCatalog(state.catalogPage + 1),
+                                            disabled: () => (state.catalogPage * state.catalogPageSize) >= state.catalogTotalCount || state.loadingCatalog,
+                                            class: "px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded disabled:opacity-40 cursor-pointer"
+                                        }, "Next"),
+                                        h("span", {class: "text-slate-400 text-[11px] ml-2"}, () => `Total: ${state.catalogTotalCount} records`)
                                     ]),
-                                    h("div", {class: "bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-xs text-slate-300 overflow-y-auto max-h-72"}, [
-                                        h("div", {class: "text-emerald-400 font-bold mb-2"}, "Audit Output Log:"),
-                                        h("pre", {class: "whitespace-pre-wrap"}, () => state.auditResult || 'Awaiting audit execution...')
+                                    h("div", {class: "flex items-center gap-2"}, [
+                                        h("button", {
+                                            onClick: downloadFlaggedZip,
+                                            class: "px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded transition shadow-xs cursor-pointer whitespace-nowrap"
+                                        }, "Export Bundle"),
+                                        h("button", {
+                                            onClick: runFlaggedCatalogLouvain,
+                                            disabled: () => state.runningCatalogLouvain,
+                                            class: "px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs rounded transition shadow-xs disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                                        }, () => state.runningCatalogLouvain ? "Analyzing..." : "Add Selected Document Chunks to Louvain Diagram")
                                     ])
                                 ])
                             ])
                         ])
-
                     )
                 )
             );

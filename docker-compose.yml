@@ -191,7 +191,7 @@ services:
           RUN test -f serverless_gateway || (echo "Compilation failed!" && exit 1)
 
           FROM alpine:3.20
-          RUN apk add --no-cache libstdc++ ca-certificates libc6-compat
+          RUN apk add libstdc++ ca-certificates libc6-compat
           WORKDIR /app
           COPY --from=builder /app/serverless_gateway /app/serverless_gateway
           EXPOSE 8081
@@ -200,13 +200,14 @@ services:
         - "8081:8081"
       environment:
         - S4_GATEWAY_URL=http://s4_gateway:8080
-      depends_on:
+      depends_on: 
         - s4_gateway
 
   app:
     build:
       context: .
       dockerfile_inline: |
+        # syntax=docker/dockerfile:1.6
         FROM python:3.11-slim
 
         WORKDIR /app
@@ -219,7 +220,8 @@ services:
             postgresql-client \
             && rm -rf /var/lib/apt/lists/*
 
-        RUN pip install --no-cache-dir \
+        RUN --mount=type=cache,target=/root/.cache/pip \
+            pip install --default-timeout=100 --retries 5 \
             "numpy<2" \
             fastapi==0.110.0 \
             uvicorn==0.28.0 \
