@@ -343,7 +343,7 @@ async def process_pending_embeddings_batch():
                     update_global_stats(cur)
                 put_db(conn)
 
-                await manager.broadcast({"type": "vector_indexed", "message": f"Successfully indexed & aggregated embedding for {domain}"})
+                await manager.broadcast({"type": "vector_indexed", "domain": domain, "pdf_url": pdf_url, "message": f"Successfully indexed & aggregated embedding for {domain}"})
                 await manager.broadcast({"type": "stats", "stats": global_stats})
             except Exception as e:
                 conn = get_db()
@@ -351,23 +351,26 @@ async def process_pending_embeddings_batch():
                 put_db(conn)
 
 async def run_wikipedia_crawl_task():
-    db_conn = get_db()
-    with db_conn.cursor() as cur:
+    conn = get_db()
+    with conn.cursor() as cur:
         cur.execute("UPDATE domains SET status = 'CRAWLING' WHERE domain = 'en.wikipedia.org'")
         update_global_stats(cur)
-    put_db(db_conn)
+    put_db(conn)
 
     await manager.broadcast({"type": "domain_update", "domain": "en.wikipedia.org", "status": "CRAWLING", "county": "National", "state": "US", "tld_type": "wiki"})
     try:
         import mwparserfromhell
         async with httpx.AsyncClient(timeout=15.0) as client:
-            model, r = get_model(), await client.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "list": "random", "rnnamespace": "0", "rnlimit": 3, "format": "json"}, headers={"User-Agent": "WikiDataExtractor/1.0"})
+            model, r = get_model(), await client.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "list": "random", "rnnamespace": "0", "rnlimit": 5, "format": "json"}, headers={"User-Agent": "GovEduMilCrawler/1.0"})
             if r.status_code == 200:
                 for p in r.json().get("query", {}).get("random", []):
                     pid_str, title = str(p["id"]), p.get("title", f"CurID {p['id']}")
                     article_url = f"https://en.wikipedia.org/?curid={pid_str}"
-                    await manager.broadcast({"type": "wiki_progress", "queue_len": 1, "current": f"Wiki: {title}", "tld_type": "wiki", "title": title})
-                    rev_r = await client.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "prop": "revisions", "rvprop": "content", "rvslots": "main", "pageids": pid_str, "format": "json"}, headers={"User-Agent": "WikiDataExtractor/1.0"})
+                    
+                    global_stats["pdfs_discovered"] += 1
+                    await manager.broadcast({"type": "document_discovered", "domain": "en.wikipedia.org", "pdf_url": article_url, "county": "National", "state": "US", "processed": 0, "title": title})
+
+                    rev_r = await client.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "prop": "revisions", "rvprop": "content", "rvslots": "main", "pageids": pid_str, "format": "json"}, headers={"User-Agent": "GovEduMilCrawler/1.0"})
                     if rev_r.status_code == 200:
                         raw_text = rev_r.json().get("query", {}).get("pages", {}).get(pid_str, {}).get("revisions", [{}])[0].get("slots", {}).get("main", {}).get("*")
                         if raw_text:
@@ -375,6 +378,7 @@ async def run_wikipedia_crawl_task():
                             if len(cleaned.split()) >= 15:
                                 s4_key = f"wiki-articles/curid-{pid_str}.txt"
                                 await upload_to_s4("public-documents", s4_key, cleaned.encode("utf-8"))
+                                
                                 db_conn = get_db()
                                 with db_conn.cursor() as cur:
                                     if not cur.execute("SELECT id FROM documents WHERE pdf_url = %s", (article_url,)).fetchone():
@@ -386,13 +390,17 @@ async def run_wikipedia_crawl_task():
                                         doc_id = cur.fetchone()[0]
                                         cur.executemany("INSERT INTO chunks (doc_id, text, granularity, embedding) VALUES (%s, %s, %s, %s::vector)", [(doc_id, s, "1_sentence", emb.tolist()) for s, emb in zip(sentences[:20], embeddings)])
                                         update_global_stats(cur)
-                                        await manager.broadcast({"type": "wiki_article", "domain": "en.wikipedia.org", "pdf_url": article_url, "county": "National", "state": "US", "processed": 1, "title": title})
+                                        
+                                        await manager.broadcast({"type": "vector_indexed", "domain": "en.wikipedia.org", "pdf_url": article_url, "message": f"Successfully indexed Wikipedia article: {title}"})
+                                        await manager.broadcast({"type": "stats", "stats": global_stats})
                                 put_db(db_conn)
+
         db_conn = get_db()
         with db_conn.cursor() as cur:
             cur.execute("UPDATE domains SET status = 'COMPLETED', visited_count = visited_count + 1 WHERE domain = 'en.wikipedia.org'")
             update_global_stats(cur)
         put_db(db_conn)
+
         await manager.broadcast({"type": "domain_update", "domain": "en.wikipedia.org", "status": "COMPLETED", "county": "National", "state": "US", "tld_type": "wiki"})
         await manager.broadcast({"type": "stats", "stats": global_stats})
     except Exception as e:
@@ -415,18 +423,13 @@ def api_catalog(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200)
     offset = (page - 1) * limit
     conn = get_db()
     with conn.cursor() as cur:
-        total_count = cur.execute("""
-            SELECT (SELECT COUNT(*) FROM domains) + (SELECT COUNT(*) FROM documents WHERE domain = 'en.wikipedia.org')
-        """).fetchone()[0] or 0
+        total_count = cur.execute("SELECT COUNT(*) FROM domains").fetchone()[0] or 0
 
         rows = cur.execute("""
             SELECT domain, state, county, status, tld_type, 
                    (SELECT COUNT(*) FROM chunks c JOIN documents d2 ON c.doc_id = d2.id WHERE d2.domain = domains.domain) 
             FROM domains
-            UNION ALL
-            SELECT 'wikipedia-' || id as domain, state, county, 'COMPLETED' as status, 'wiki' as tld_type,
-                   (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = documents.id)
-            FROM documents WHERE domain = 'en.wikipedia.org'
+            ORDER BY domain
             LIMIT %s OFFSET %s
         """, (limit, offset)).fetchall()
     put_db(conn)
@@ -435,7 +438,7 @@ def api_catalog(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200)
         "items": [{
             "id": idx + offset + 1,
             "domain": r[0],
-            "url": f"https://{r[0]}" if not r[0].startswith("wikipedia-") else r[0],
+            "url": f"https://{r[0]}",
             "state": r[1],
             "county": r[2],
             "status": r[3],
