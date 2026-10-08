@@ -42,13 +42,15 @@
                 q: "",
                 exhaustive: false,
                 isEmbActive: false,
-                progress: { visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, gov_completed: 0, wiki_crawled: 0, gov_crawled: 0, edu_crawled: 0, mil_crawled: 0, total_gov: 0, total_edu: 0, total_mil: 0, total_wiki: 6800000 },
+                progress: { visited: 0, total: 0, pdfs_discovered: 0, domains_crawled: 0, total_domains: 0, gov_completed: 0, wiki_crawled: 0, arxiv_crawled: 0, gov_crawled: 0, edu_crawled: 0, mil_crawled: 0, total_gov: 0, total_edu: 0, total_mil: 0, total_wiki: 6800000, total_arxiv: 2500000 },
                 isPaused: true,
                 graphData: { nodes: [], edges: [], community_count: 0, modularity: 0.0, clustering_coefficient: 0.0 },
                 graphLoading: false,
                 nodeQuery: "",
                 wikiTotal: 0,
+                arxivTotal: 0,
                 wikiTotalCount: 6800000,
+                arxivTotalCount: 2500000,
                 pendingEmbeddings: 0,
                 totalEmbeddings: 0,
                 pinnedNodes: [],
@@ -75,6 +77,7 @@
             const [showProgressTooltip, setShowProgressTooltip] = createSignal(false);
 
             let graphAbortController = null;
+            const catalogCache = {};
 
             const [searchResultResource, { mutate: mutateSearchResults }] = createResource(searchTrigger, async (query) => {
                 if (!query) return [];
@@ -107,6 +110,10 @@
                             setState("wikiTotal", initState.progress.wiki_crawled);
                             setState("progress", "wiki_crawled", initState.progress.wiki_crawled);
                         }
+                        if (initState.progress.arxiv_crawled !== undefined) {
+                            setState("arxivTotal", initState.progress.arxiv_crawled);
+                            setState("progress", "arxiv_crawled", initState.progress.arxiv_crawled);
+                        }
                     }
                     const statRes = await (await fetch("/crawler/status-legacy")).json();
                     setState("isPaused", statRes.paused);
@@ -114,6 +121,7 @@
 
                 fetchStats();
                 fetchWikiStats();
+                fetchArxivStats();
                 fetchGraphCommunities();
                 fetchCatalog(state.catalogPage);
 
@@ -123,6 +131,7 @@
 
                 setInterval(async () => {
                     fetchWikiStats();
+                    fetchArxivStats();
                 }, 3000);
 
                 const connectWs = () => {
@@ -137,29 +146,43 @@
                                         setState("wikiTotal", d.stats.wiki_crawled);
                                         setState("progress", "wiki_crawled", d.stats.wiki_crawled);
                                     }
+                                    if (d.stats.arxiv_crawled !== undefined) {
+                                        setState("arxivTotal", d.stats.arxiv_crawled);
+                                        setState("progress", "arxiv_crawled", d.stats.arxiv_crawled);
+                                    }
                                 }
                             } else if (d.type === "queue_update") {
                                 log("QUEUE", `Queue [${d.tld_type || 'gov'}]: Current target "${d.current || 'Unknown'} (${d.queue_len || 0} remaining)"`);
-                            } else if (d.type === "pdf_found" || d.type === "document_discovered" || d.type === "wiki_crawl" || d.type === "wiki_article" || d.type === "wiki_progress" || d.domain === "en.wikipedia.org") {
+                            } else if (d.type === "pdf_found" || d.type === "document_discovered" || d.type === "wiki_crawl" || d.type === "wiki_article" || d.type === "arxiv_paper" || d.domain === "en.wikipedia.org" || d.domain === "arxiv.org") {
                                 if (d.domain === "en.wikipedia.org" || d.title || d.type.includes("wiki")) {
                                     log("WIKI", `Crawled Wiki Article: ${d.title || d.pdf_url || d.current || 'In Progress'}`);
                                     setState("progress", "wiki_crawled", (state.progress.wiki_crawled || 0) + 1);
                                     setState("wikiTotal", (state.wikiTotal || 0) + 1);
+                                } else if (d.domain === "arxiv.org" || d.type.includes("arxiv")) {
+                                    log("ARXIV", `Crawled arXiv Paper: ${d.title || d.pdf_url || 'In Progress'}`);
+                                    setState("progress", "arxiv_crawled", (state.progress.arxiv_crawled || 0) + 1);
+                                    setState("arxivTotal", (state.arxivTotal || 0) + 1);
                                 } else {
                                     log("DISCOVERY", `Discovered document: ${d.pdf_url || 'Unknown URL'}`);
                                 }
                                 fetchStats();
                                 fetchWikiStats();
+                                fetchArxivStats();
+                                delete catalogCache[state.catalogPage];
                                 fetchCatalog(state.catalogPage);
                             } else if (d.type === "domain_update" || d.type === "crawl_complete") {
                                 log("CRAWL", `Domain [${d.domain || 'Target'}]: Status -> ${d.status || 'SUCCESS'}`);
                                 fetchWikiStats();
+                                fetchArxivStats();
+                                delete catalogCache[state.catalogPage];
                                 fetchCatalog(state.catalogPage);
                                 if (mapContainer && state.activeTab === 'map') updateMapColors();
                             } else if (d.type === "embedding_complete" || d.type === "vector_indexed") {
                                 log("EMBEDDING", "Vector embedding generated & stored.");
                                 fetchStats();
                                 fetchWikiStats();
+                                fetchArxivStats();
+                                delete catalogCache[state.catalogPage];
                                 fetchCatalog(state.catalogPage);
                             } else if (d.message) {
                                 log(d.type || "INFO", d.message);
@@ -179,13 +202,38 @@
                 } catch (e) {}
             };
 
+            const fetchArxivStats = async () => {
+                try {
+                    const r = await (await fetch("/arxiv/status")).json();
+                    setState("arxivTotal", r.total_downloaded || 0);
+                    setState("progress", "arxiv_crawled", r.total_downloaded || 0);
+                } catch (e) {}
+            };
+
             const fetchCatalog = async (page = 1) => {
+                if (catalogCache[page]) {
+                    setState("catalogItems", catalogCache[page].items);
+                    setState("catalogTotalCount", catalogCache[page].total);
+                    setState("catalogPage", page);
+                    return;
+                }
                 setState("loadingCatalog", true);
                 try {
                     const r = await (await fetch(`/api/catalog?page=${page}&limit=${state.catalogPageSize}`)).json();
-                    setState("catalogItems", r.items || []);
-                    setState("catalogTotalCount", r.total || r.total_count || 0);
+                    const items = r.items || [];
+                    const total = r.total || 0;
+                    catalogCache[page] = { items, total };
+                    setState("catalogItems", items);
+                    setState("catalogTotalCount", total);
                     setState("catalogPage", page);
+
+                    if ((page * state.catalogPageSize) < total && !catalogCache[page + 1]) {
+                        fetch(`/api/catalog?page=${page + 1}&limit=${state.catalogPageSize}`)
+                            .then(res => res.json())
+                            .then(nextRes => {
+                                catalogCache[page + 1] = { items: nextRes.items || [], total: nextRes.total || total };
+                            }).catch(() => {});
+                    }
                 } catch (e) {
                     setState("catalogItems", []);
                 } finally {
@@ -216,7 +264,10 @@
                     });
                     const r = await res.json();
                     log("SCRAPE", r.message || `Started scrape & embed for ${domain}`);
-                    setTimeout(() => fetchCatalog(state.catalogPage), 1500);
+                    setTimeout(() => {
+                        delete catalogCache[state.catalogPage];
+                        fetchCatalog(state.catalogPage);
+                    }, 1500);
                 } catch (e) {
                     alert("Failed to trigger scrape for " + domain);
                 } finally {
@@ -312,7 +363,7 @@
                     .attr("fill", "#e2e8f0")
                     .on("mousemove", (event, d) => {
                         const name = d.properties.name || "Unknown";
-                        tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong>`);
+                        tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>Loading county statistics...`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
@@ -322,7 +373,7 @@
                     .attr("d", path).attr("fill", "transparent").attr("stroke", "#475569").attr("stroke-width", 0.6)
                     .on("mousemove", (event, d) => {
                         const name = d.properties.name;
-                        tooltip.classed("hidden", false).html(`<strong>${name}</strong>`);
+                        tooltip.classed("hidden", false).html(`<strong>${name}</strong><br/>Loading state statistics...`);
                         const [x, y] = d3.pointer(event, container);
                         tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                     })
@@ -344,7 +395,12 @@
                         .attr("fill", d => statusMaps.gov[d.properties.name] === 'COMPLETED' ? "#10b981" : (['CRAWLING', 'QUEUED'].includes(statusMaps.gov[d.properties.name]) ? "#f59e0b" : "#e2e8f0"))
                         .on("mousemove", (event, d) => {
                             const name = d.properties.name || "Unknown";
-                            tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>.gov: ${statusMaps.gov[name] || 'CATALOGED'}<br/>.edu: ${statusMaps.edu[name] || 'CATALOGED'}<br/>.mil: ${statusMaps.mil[name] || 'CATALOGED'}`);
+                            const govStatus = statusMaps.gov[name];
+                            if (!govStatus) {
+                                tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>Loading county statistics...`);
+                            } else {
+                                tooltip.classed("hidden", false).html(`<strong>County: ${name}</strong><br/>.gov: ${statusMaps.gov[name] || 'CATALOGED'}<br/>.edu: ${statusMaps.edu[name] || 'CATALOGED'}<br/>.mil: ${statusMaps.mil[name] || 'CATALOGED'}`);
+                            }
                             const [x, y] = d3.pointer(event, container);
                             tooltip.style("left", (x + 15) + "px").style("top", (y - 15) + "px");
                         });
@@ -544,12 +600,13 @@
                                 onMouseLeave: () => setShowProgressTooltip(false),
                                 class: "text-lg font-semibold tracking-tight text-slate-900 cursor-pointer underline decoration-dotted decoration-slate-400"
                             }, "Public Documents"),
-                            () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-1.5 w-64 bg-slate-900 text-white p-2.5 rounded shadow-xl z-[9999] font-mono text-[11px] space-y-1 border border-slate-700"}, [
+                            () => showProgressTooltip() && h("div", {class: "absolute left-0 top-full mt-1.5 w-72 bg-slate-900 text-white p-2.5 rounded shadow-xl z-[9999] font-mono text-[11px] space-y-1 border border-slate-700"}, [
                                 h("div", {class: "text-emerald-400 font-bold border-b border-slate-700 pb-1 mb-1"}, "Pipeline Progress Overview"),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".gov Crawled:"), h("span", {}, `${state.progress.gov_crawled || 0} / ${state.progress.total_gov || 0}`)]),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".edu Crawled:"), h("span", {}, `${state.progress.edu_crawled || 0} / ${state.progress.total_edu || 0}`)]),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, ".mil Crawled:"), h("span", {}, `${state.progress.mil_crawled || 0} / ${state.progress.total_mil || 0}`)]),
                                 h("div", {class: "flex justify-between"}, [h("span", {}, "Wiki Articles:"), h("span", {}, `${state.progress.wiki_crawled || state.wikiTotal || 0} / 6800000`)]),
+                                h("div", {class: "flex justify-between text-cyan-400"}, [h("span", {}, "arXiv Papers:"), h("span", {}, `${state.progress.arxiv_crawled || state.arxivTotal || 0} / 2500000`)]),
                                 h("div", {class: "flex justify-between text-amber-400"}, [h("span", {}, "Total Embeddings:"), h("span", {}, `${state.totalEmbeddings || 0}`)]),
                                 h("div", {class: "flex justify-between text-amber-300"}, [h("span", {}, "Pending Embeddings:"), h("span", {}, `${state.pendingEmbeddings || 0}`)]),
                                 h("div", {class: "border-t border-slate-700 pt-1 mt-1 flex justify-between text-slate-300"}, [h("span", {}, "PDFs Discovered:"), h("span", {}, `${state.progress.pdfs_discovered || 0}`)]),
@@ -634,7 +691,7 @@
                                         h("button", {type: "button", onClick: () => setState("pinMode", !state.pinMode), class: () => `px-1.5 py-0.2 rounded font-medium text-[10px] ${state.pinMode ? 'bg-amber-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}, () => state.pinMode ? `Pinned (${state.pinnedNodes.length})` : "Pin Mode"),
                                         h("button", {type: "button", onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 1.3), class: "px-1.5 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[10px]"}, "+"),
                                         h("button", {type: "button", onClick: () => zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.scaleBy, 0.7), class: "px-1.5 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[10px]"}, "-"),
-                                        h("button", {type: "button", onClick: () => { setState("pinnedNodes", []); zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomBehavior.transform, d3.zoomIdentity); }, class: "px-1 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[9px]"}, "Reset"),
+                                        h("button", {type: "button", onClick: () => { setState("pinnedNodes", []); zoomBehavior && d3.select(graphContainer.querySelector("canvas")).transition().call(zoomIdentity); }, class: "px-1 py-0.2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[9px]"}, "Reset"),
                                         h("button", {type: "button", onClick: () => setState("isGraphFullscreen", !state.isGraphFullscreen), class: "px-1.5 py-0.2 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-bold text-[9px]"}, () => state.isGraphFullscreen ? "Exit" : "Maximize")
                                     ])
                                 ]),
@@ -742,7 +799,7 @@
                                         h("thead", {class: "bg-slate-100 text-slate-600 sticky top-0 z-10 border-b border-slate-200"}, [
                                             h("tr", {}, [
                                                 h("th", {class: "py-2 px-2.5 w-8 text-center font-semibold"}, ""),
-                                                h("th", {class: "py-2 px-2.5 font-semibold"}, "Domain / URL"),
+                                                h("th", {class: "py-2 px-2.5 font-semibold"}, "Domain / URL / Article"),
                                                 h("th", {class: "py-2 px-2.5 font-semibold"}, "Type"),
                                                 h("th", {class: "py-2 px-2.5 font-semibold"}, "Status"),
                                                 h("th", {class: "py-2 px-2.5 font-semibold text-right"}, "Chunks"),
@@ -762,7 +819,16 @@
                                                     })
                                                 ]),
                                                 h("td", {class: "py-2 px-2.5 max-w-xs truncate"}, [
-                                                    h("a", {href: item.url, target: "_blank", class: "text-emerald-600 hover:underline font-semibold block truncate"}, item.url),
+                                                    h("a", {
+                                                        href: item.url, 
+                                                        target: "_blank", 
+                                                        class: "text-emerald-600 hover:underline font-semibold block truncate"
+                                                    }, item.domain === 'en.wikipedia.org' && item.summary && item.summary.includes('Wiki Title:') 
+                                                        ? item.summary.split('|')[0].replace('Wiki Title:', '').trim() 
+                                                        : (item.domain === 'arxiv.org' && item.summary && item.summary.includes('arXiv Title:') 
+                                                            ? item.summary.split('|')[0].replace('arXiv Title:', '').trim() 
+                                                            : item.url)
+                                                    ),
                                                     h("span", {class: "text-[10px] text-slate-400"}, `${item.county || 'National'}, ${item.state || 'US'}`)
                                                 ]),
                                                 h("td", {class: "py-2 px-2.5 uppercase text-[10px]"}, [

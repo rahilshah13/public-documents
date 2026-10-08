@@ -218,6 +218,18 @@ services:
             git \
             libpq-dev \
             postgresql-client \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libcairo2 \
             && rm -rf /var/lib/apt/lists/*
 
         RUN --mount=type=cache,target=/root/.cache/pip \
@@ -234,7 +246,10 @@ services:
             websockets==12.0 \
             networkx==3.2.1 \
             mwparserfromhell==0.7.2 \
-            reportlab==4.1.0
+            reportlab==4.1.0 \
+            playwright==1.42.0
+
+        RUN playwright install chromium
 
         RUN cat <<'EOF' > abbr_map.json
         {
